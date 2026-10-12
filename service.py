@@ -139,6 +139,9 @@ def _open_gates():
 
 
 def live_runtime() -> Runtime:
+    from agent.secret_scope import get_secret
+
+    env = {k: get_secret(k) for k in ("MEILI_HOST", "MEILI_API_KEY")}
     status, data_dir_fn = _load("plugins.plugin_storage", "plugin_data_dir")
     if status != "ok":
         raise RuntimeError("data dir unavailable")
@@ -282,7 +285,7 @@ def live_runtime() -> Runtime:
         guard_fn = None
 
     return Runtime(
-        env=os.environ,
+        env=env,
         data_dir=data_dir,
         cron=cron,
         host=host,

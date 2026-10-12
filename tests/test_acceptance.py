@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import types
 import urllib.request
@@ -1171,6 +1172,11 @@ def test_a_manual_check_in_the_isolated_form_does_not_silence_the_next_cron(tmp_
 
 
 def _install_hermes_fakes(monkeypatch, tmp_path):
+    try:
+        import agent.secret_scope as real_scope
+    except ImportError:
+        real_scope = None
+
     def put(name, **attrs):
         mod = types.ModuleType(name)
         for key, value in attrs.items():
@@ -1213,6 +1219,22 @@ def _install_hermes_fakes(monkeypatch, tmp_path):
     put("hermes_cli")
     put("hermes_cli.profiles", get_active_profile_name=lambda: "work")
     put("cron.scheduler_delivery", _is_known_delivery_platform=lambda name: False)
+    # live_runtime reads MEILI_* through agent.secret_scope. The fake agent package
+    # must still expose that module, or the helper probe raises ImportError.
+    if real_scope is None:
+        real_scope = types.ModuleType("agent.secret_scope")
+
+        def get_secret(name, default=None):
+            value = os.environ.get(name)
+            return default if value is None else value
+
+        real_scope.get_secret = get_secret
+        real_scope.UnscopedSecretError = type("UnscopedSecretError", (RuntimeError,), {})
+        real_scope.set_secret_scope = lambda mapping: None
+        real_scope.reset_secret_scope = lambda token: None
+        real_scope.set_multiplex_active = lambda active: None
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", real_scope)
+    setattr(sys.modules["agent"], "secret_scope", real_scope)
 
 
 def _break_helper(monkeypatch, module, name, mode):
@@ -1380,3 +1402,136 @@ def test_public_sources_have_no_cli_or_engine_routes():
     assert "config_schema" not in blob
     for name in ("slack", "telegram", "discord", "matrix"):
         assert name not in blob
+
+
+_SEARCH_ARGS = {"index": "probes", "q": "hermes", "id_field": "sku"}
+_MEILI_ENV_READ = re.compile(
+    r"""os\s*\.\s*(?:getenv\s*\(|environ\s*\.\s*get\s*\(|environ\s*\[\s*)\s*['\"](?:MEILI_HOST|MEILI_API_KEY)['\"]"""
+)
+
+
+def _search_handler():
+    # A file named __init__.py is a package unless search locations are cleared.
+    # The flat import is the same live_runtime() the package path calls, and it
+    # uses the service module this test patches.
+    spec = importlib.util.spec_from_file_location("index_search_scope_entry", ROOT / "__init__.py")
+    spec.submodule_search_locations = None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    found = {}
+
+    class Ctx:
+        def register_tool(self, **kwargs):
+            found[kwargs["name"]] = kwargs["handler"]
+
+    mod.register(Ctx())
+    return found["index_search"]
+
+
+def _patch_data_dir(monkeypatch, tmp_path):
+    def fake(module, name):
+        if module == "plugins.plugin_storage" and name == "plugin_data_dir":
+            return "ok", (lambda plugin_name: tmp_path)
+        return "missing", None
+
+    monkeypatch.setattr(service, "_load", fake)
+
+
+def _release_scope(scope, token):
+    if token is not None:
+        try:
+            scope.reset_secret_scope(token)
+        except ValueError:
+            pass
+    scope.set_secret_scope(None)
+    scope.set_multiplex_active(False)
+
+
+def test_scope_value_is_used_when_environ_differs(monkeypatch, tmp_path):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("MEILI_HOST", "http://env.example:9")
+    monkeypatch.setenv("MEILI_API_KEY", "env-key-value")
+    calls = []
+
+    def perform(method, url, headers, body, timeout=30, open_fn=None):
+        calls.append({"url": url, "authorization": headers.get("Authorization")})
+        return page([hit()])
+
+    monkeypatch.setattr(client, "perform", perform)
+    _patch_data_dir(monkeypatch, tmp_path)
+    handler = _search_handler()
+    token = scope.set_secret_scope({
+        "MEILI_HOST": "http://scope.example:9",
+        "MEILI_API_KEY": "scope-key-value",
+    })
+    try:
+        out = body_of(handler(_SEARCH_ARGS))
+        assert out["ok"] is True
+        assert calls[0]["url"].startswith("http://scope.example:9/")
+        assert calls[0]["authorization"] == "Bearer scope-key-value"
+        scope.reset_secret_scope(token)
+        token = scope.set_secret_scope({
+            "MEILI_HOST": "http://scope-two.example:9",
+            "MEILI_API_KEY": "scope-key-two",
+        })
+        body_of(handler(_SEARCH_ARGS))
+        assert calls[1]["url"].startswith("http://scope-two.example:9/")
+        assert calls[1]["authorization"] == "Bearer scope-key-two"
+    finally:
+        _release_scope(scope, token)
+
+
+def test_multiplex_scope_miss_does_not_read_environ(monkeypatch, tmp_path):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("MEILI_HOST", "http://env.example:9")
+    monkeypatch.setenv("MEILI_API_KEY", "env-key-value")
+    calls = []
+
+    def perform(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("upstream was called")
+
+    monkeypatch.setattr(client, "perform", perform)
+    _patch_data_dir(monkeypatch, tmp_path)
+    handler = _search_handler()
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({"UNRELATED": "present"})
+    try:
+        raw = handler(_SEARCH_ARGS)
+    finally:
+        _release_scope(scope, token)
+    out = body_of(raw)
+    assert out["ok"] is False
+    assert out["message"] == service.MSG_HOST_REQUIRED
+    assert calls == []
+    assert "env.example" not in raw
+    assert "env-key-value" not in raw
+
+
+def test_unscoped_multiplex_raises_and_does_not_call_upstream(monkeypatch, tmp_path):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("MEILI_HOST", "http://env.example:9")
+    monkeypatch.setenv("MEILI_API_KEY", "env-key-value")
+    calls = []
+
+    def perform(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("upstream was called")
+
+    monkeypatch.setattr(client, "perform", perform)
+    _patch_data_dir(monkeypatch, tmp_path)
+    handler = _search_handler()
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope(None)
+    try:
+        with pytest.raises(scope.UnscopedSecretError):
+            handler(_SEARCH_ARGS)
+    finally:
+        _release_scope(scope, token)
+    assert calls == []
+
+
+def test_plugin_code_does_not_read_meili_from_environ():
+    blob = "\n".join(path.read_text(encoding="utf-8") for path in sorted(ROOT.glob("*.py")))
+    assert _MEILI_ENV_READ.search(blob) is None
+    assert "env=os.environ" not in (ROOT / "service.py").read_text(encoding="utf-8")
