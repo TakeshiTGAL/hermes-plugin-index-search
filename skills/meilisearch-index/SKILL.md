@@ -9,7 +9,7 @@ First call, no approval: `index_health` with no arguments. It does not send the 
 
 `index_search` needs index, q, and id_field together. If the user did not name the id field, use id. If the reply is not ok, do what next_step says once. Do not add limit or filter.
 
-`index_watch` with action status reads the watch and does not ask for approval. schedule and unschedule each ask once. Answer in the language the user used.
+`index_watch` with action status reads the saved query. This plugin does not ask. To watch new documents, call `index_watch` with action save and the index, q, and id_field, then run the printed `hermes cron create` line. Answer in the language the user used.
 
 Japanese requests use the same tools. Search in English, then answer in Japanese:
 
@@ -17,4 +17,4 @@ Japanese requests use the same tools. Search in English, then answer in Japanese
 - How the index looks. 「索引の様子」 → tool_search "Meilisearch health" → `index_health` with no arguments <!-- ja-alias -->
 - Search notes for cats. 「猫を検索」 → tool_search "Meilisearch index" → `index_search` {"index": "notes", "q": "cats", "id_field": "id"} <!-- ja-alias -->
 - Run one index search. 「検索して」 → tool_search "Meilisearch index" → `index_search` {"index": "notes", "q": "cats", "id_field": "id"} <!-- ja-alias -->
-- Watch for new documents. 「新しい文書を見張って」 → tool_search "Meilisearch watch" → `index_watch` {"action": "status"} <!-- ja-alias -->
+- Watch for new documents. 「新しい文書を見張って」 → tool_search "Meilisearch watch" → `index_watch` {"action": "save", "index": "notes", "q": "cats", "id_field": "id"} <!-- ja-alias -->

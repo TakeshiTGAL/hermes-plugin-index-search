@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
-import html
 import importlib
 import json
 import os
 import re
-import threading
 import time
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -21,25 +18,13 @@ else:
 
 TOOLSET = "index_search"
 PLUGIN_NAME = "index-search"
-# Internal schedule only. Public text says "every 15 minutes" and never this expression.
-SCHEDULE_EXPR = "*/15 * * * *"
-REASON_BUDGET = 300
-# An HTML approval card measures the reason after html.escape and cuts past this.
-ESCAPED_REASON_BUDGET = 500
 SEEN_CAP = store.SEEN_CAP
 DAY = 86400
 # A daily tick can land a few seconds early. The margin stays inside one 15-minute slot.
 CADENCE_EARLY = 90
 UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SAFE_CODE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
-ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
-REWRITE_CHARS = set("<>*\\`~[]|@")
-# Markdown emphasis with an underscore needs a word edge on both ends, so movies_en_us and
-# created_at_id are shown unchanged and only a run like _bold_ is a rewrite.
-EMPHASIS_RE = re.compile(r"(?<![0-9A-Za-z_])_(?!\s)[^\n]*?_(?![0-9A-Za-z])")
-SCHEDULE_TOKENS = {"every", "in", "at", "weekdays", "monday", "9am", "5m"}
-REFUSED_DELIVER = {"cli", "cron", "api_server", "bot-chat"}
-PLAIN_DELIVER = {"origin", "local", "all"}
+_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 MSG_QUERY = "The query must be a non-empty string of 400 characters or fewer."
 MSG_SEARCH_ARGS = (
@@ -64,40 +49,25 @@ MSG_HOST_BAD = "MEILI_HOST is not a usable origin."
 MSG_KEY_REQUIRED = "MEILI_API_KEY is required for search."
 MSG_REDIRECT = "The server redirected the request. It was not followed."
 MSG_INCOMPLETE = "The search did not complete, and seen ids were not advanced."
-MSG_SCHEDULE_NOT_WRITTEN = "The new cron job was removed, and the watch file was not written. Seen ids were not changed."
-MSG_UNSCHEDULE_NOT_WRITTEN = "The cron job {job_id} was removed, but the watch file was not updated. The file still says a watch is scheduled. Seen ids were not changed."
 MSG_PAGE_NOT_SAVED = "The page was read, but the watch file was not written. Seen ids were not advanced."
-MSG_ORIGIN_UNREADABLE = "The session origin could not be read, so no job was created. Seen ids were not changed."
 MSG_NO_ID = "A hit has no usable id field, so seen ids were not advanced."
 MSG_DUP = "This page has duplicate ids, so seen ids were not advanced."
 MSG_TOO_MANY = "The page has more than 20 hits, so seen ids were not advanced."
 MSG_ZERO = "This page has 0 hits. Seen ids were kept."
 MSG_BASELINE = "Baseline saved. These ids are not reported as new."
 MSG_NOT_CRON_BASELINE = "This check is not a proven cron run, so the baseline was not saved. Seen ids were not advanced."
-REWRITE_LABELS = {
-    "index": "index uid",
-    "q": "query",
-    "id_field": "id field",
-    "deliver": "delivery target",
-    "job_id": "cron job id",
-}
 MSG_CANNOT = "This form cannot monitor, so seen ids were not advanced."
 MSG_GAP = (
     " This page shares no saved id, so matches between the saved ids and this page may have been missed."
 )
 MSG_MANUAL_SEEN = " This call did not write seen ids."
 MSG_HEALTH_ARGS = "index_health takes no arguments, so call it with an empty object."
-MSG_APPROVAL_FIT = "The approval text does not fit in one message. Shorten the query and try again."
 MSG_BAD_PAGE = "The search returned an unusable page, so seen ids were not advanced."
 MSG_ACTION = (
-    "index_watch action must be schedule, unschedule, status, or check. "
+    "index_watch action must be save, status, or check. "
     "Call index_watch with action status to see the watch. Status does not ask for approval. " "日本語: 見張りを見るだけなら action を status にして index_watch をもう一度呼ぶ。"
 )
 MSG_KEY_IN_URL = "The API key is part of the request URL, so nothing was sent."
-MSG_NOTHING_UNSCHEDULE = "There is nothing to unschedule. Seen ids were kept."
-MSG_JOB_GONE = "The cron job is gone. Seen ids were not advanced."
-MSG_JOB_GONE_KEPT = "The cron job is gone. Seen ids were kept."
-MSG_JOB_UNKNOWN = "The cron job could not be confirmed, so seen ids were not advanced."
 MSG_LIMIT = (
     " Only the first 20 hits are watched. If estimatedTotalHits is over 20, "
     "matches past that page are never reported."
@@ -106,30 +76,15 @@ MSG_LIMIT = (
 JOB_PROMPT = (
     "Call the index_watch tool with action check and no other arguments. "
     "If notify is true, relay the tool message and nothing else. "
-    "If notify is false, reply with exactly [SILENT]. "
-    "Do not call index_search. Calling index_search does not advance seen ids. "
-    "Do not schedule or unschedule."
+    "If notify is false, reply with exactly [SILENT]."
 )
-
-
-def _load(module: str, name: str):
-    try:
-        mod = importlib.import_module(module)
-    except Exception:
-        return "failed", None
-    if not hasattr(mod, name):
-        return "missing", None
-    try:
-        return "ok", getattr(mod, name)
-    except Exception:
-        return "failed", None
 
 
 class Runtime:
     def __init__(self, **kwargs):
         self.env = kwargs.get("env") or {}
         self.data_dir = Path(kwargs["data_dir"])
-        self.now = kwargs.get("now") or __import__("time").time
+        self.now = kwargs.get("now") or time.time
         self.cron = kwargs.get("cron") or (lambda: "not_cron")
         self.host = kwargs.get("host") or (lambda: None)
         self.exchange = kwargs.get("exchange") or client.perform
@@ -161,39 +116,63 @@ def _open_gates():
     }
 
 
-def live_runtime() -> Runtime:
+def clean_profile(name: object) -> str | None:
+    if not isinstance(name, str) or not _PROFILE_NAME.fullmatch(name.strip()):
+        return None
+    return name.strip() or None
+
+
+def plugin_data_directory() -> Path:
+    try:
+        module = importlib.import_module("plugins.plugin_storage")
+    except Exception as exc:
+        raise RuntimeError("data dir unavailable") from exc
+    fn = getattr(module, "plugin_data_dir", None)
+    if not callable(fn):
+        raise RuntimeError("data dir unavailable")
+    try:
+        path = fn(PLUGIN_NAME)
+    except Exception as exc:
+        raise RuntimeError("data dir unavailable") from exc
+    return path if isinstance(path, Path) else Path(path)
+
+
+def _cron_mark() -> str:
+    try:
+        module = importlib.import_module("cron.execution_identity")
+        fn = getattr(module, "current_cron_execution", None)
+        if not callable(fn):
+            return "unknown"
+        return "cron" if fn() is not None else "not_cron"
+    except Exception:
+        return "unknown"
+
+
+def _guard_or_none():
+    try:
+        module = importlib.import_module("agent.file_safety")
+        fn = getattr(module, "get_write_denied_error", None)
+    except Exception:
+        return None
+    if not callable(fn):
+        return None
+
+    def guard(path: str):
+        return fn(path)
+
+    return guard
+
+
+def live_runtime(profile: str | None = None) -> Runtime:
     from agent.secret_scope import get_secret
 
     env = {k: get_secret(k) for k in ("MEILI_HOST", "MEILI_API_KEY")}
-    status, data_dir_fn = _load("plugins.plugin_storage", "plugin_data_dir")
-    if status != "ok":
-        raise RuntimeError("data dir unavailable")
-    try:
-        data_dir = data_dir_fn(PLUGIN_NAME)
-    except Exception as exc:
-        raise RuntimeError("data dir unavailable") from exc
-
-    def cron():
-        # Published mark. A missing helper is not a manual turn.
-        try:
-            module = importlib.import_module("cron.execution_identity")
-            fn = getattr(module, "current_cron_execution", None)
-            if not callable(fn):
-                return "unknown"
-            return "cron" if fn() is not None else "not_cron"
-        except Exception:
-            return "unknown"
+    data_dir = plugin_data_directory()
 
     def host():
         if "HERMES_PLUGIN_HOST_PROCESS" not in os.environ:
             return None
         return os.environ.get("HERMES_PLUGIN_HOST_PROCESS")
-
-    def guard(path: str):
-        status, fn = _load("agent.file_safety", "get_write_denied_error")
-        if status != "ok":
-            raise RuntimeError("write guard missing")
-        return fn(path)
 
     def gates():
         # yolo, approvals off, cron, single-query, and unattended are Hermes's gate.
@@ -206,91 +185,16 @@ def live_runtime() -> Runtime:
             "approval_loaded": True,
         }
 
-    def request_approval(question: str):
-        return {"approved": False}
-
-    def create_job(**kwargs):
-        status, fn = _load("cron.jobs", "create_job")
-        if status != "ok":
-            raise RuntimeError("create_job unavailable")
-        call = {
-            "prompt": kwargs["prompt"],
-            "schedule": kwargs["schedule"],
-            "name": kwargs["name"],
-            "deliver": kwargs["deliver"],
-            "enabled_toolsets": kwargs["enabled_toolsets"],
-            "no_agent": False,
-        }
-        # Only the shared origin argument. Main-only kwargs are not passed.
-        if kwargs.get("origin") is not None:
-            call["origin"] = kwargs["origin"]
-        return fn(**call)
-
-    def session_origin(schedule):
-        status, fn = _load("tools.cronjob_job_args", "_origin_from_env")
-        if status != "ok":
-            raise RuntimeError("origin helper missing")
-        found = fn(schedule)
-        if found is None:
-            return None
-        if not isinstance(found, dict):
-            raise RuntimeError("origin helper returned a non-dict")
-        return found
-
-    def remove_job(job_id: str):
-        status, fn = _load("cron.jobs", "remove_job")
-        if status != "ok":
-            raise RuntimeError("remove_job unavailable")
-        return fn(job_id)
-
-    def get_job(job_id: str):
-        status, fn = _load("cron.jobs", "get_job")
-        if status != "ok":
-            raise RuntimeError("get_job unavailable")
-        return fn(job_id)
-
-    def profile():
-        status, fn = _load("hermes_cli.profiles", "get_active_profile_name")
-        if status != "ok":
-            return None
-        try:
-            name = fn()
-        except Exception:
-            return None
-        if not isinstance(name, str) or not name.strip():
-            return None
-        return name
-
-    def known_platform(name: str):
-        status, fn = _load("cron.scheduler_delivery", "_is_known_delivery_platform")
-        if status != "ok":
-            return None
-        try:
-            return bool(fn(name))
-        except Exception:
-            return None
-
-    guard_fn = guard
-    # A missing guard must not look like an allowed write. Probe the import once.
-    status, _fn = _load("agent.file_safety", "get_write_denied_error")
-    if status != "ok":
-        guard_fn = None
-
     return Runtime(
         env=env,
         data_dir=data_dir,
-        cron=cron,
+        cron=_cron_mark,
         host=host,
         gates=gates,
-        request_approval=request_approval,
-        create_job=create_job,
-        remove_job=remove_job,
-        get_job=get_job,
-        profile=profile,
-        known_platform=known_platform,
-        write_guard=guard_fn,
-        session_origin=session_origin,
-        public_approval=True,
+        request_approval=lambda question: {"approved": False},
+        profile=lambda: profile,
+        write_guard=_guard_or_none(),
+        public_approval=False,
     )
 
 
@@ -845,33 +749,6 @@ def _cannot_monitor(runtime: Runtime, secret: str) -> str:
     return reply(MSG_CANNOT, ok=False, notify=True, secret=secret, retryable=False)
 
 
-def _mark_job_gone(runtime: Runtime, state: dict, secret: str, message: str, *, notify: bool, ok: bool, retryable: bool | None = None) -> str:
-    """Drop a job id that Hermes no longer has. Later calls still say it is gone."""
-    state = dict(state)
-    state["scheduled"] = False
-    state["job_id"] = ""
-    state["job_gone"] = True
-    written = store.save(runtime.data_dir, state, runtime.write_guard)
-    if written != "ok":
-        return reply(
-            message + " The watch file still names that job.",
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    return reply(message, ok=ok, notify=notify, secret=secret, retryable=retryable, scheduled=False)
-
-
-def _job_presence(runtime: Runtime, job_id: str) -> str:
-    if not job_id:
-        return "skip"
-    try:
-        found = runtime.get_job(job_id)
-    except Exception:
-        return "unreadable"
-    if found:
-        return "present"
-    return "gone"
-
-
 def index_watch_check(runtime: Runtime) -> str:
     secret = _secret(runtime)
     if _form(runtime) == "cannot":
@@ -883,14 +760,10 @@ def index_watch_check(runtime: Runtime) -> str:
             ok=False, notify=True, secret=secret, retryable=False,
         )
     if kind != "ready":
-        if state and state.get("job_gone"):
-            return reply(MSG_JOB_GONE, ok=False, notify=True, secret=secret, retryable=False)
-        return reply("No watch is scheduled, so seen ids were not advanced.", ok=False, notify=False, secret=secret)
-    presence = _job_presence(runtime, state.get("job_id") or "")
-    if presence == "gone":
-        return _mark_job_gone(runtime, state, secret, MSG_JOB_GONE, notify=True, ok=False, retryable=False)
-    if presence == "unreadable":
-        return reply(MSG_JOB_UNKNOWN, ok=False, notify=True, secret=secret, retryable=False)
+        return reply(
+            "No watch query is saved, so seen ids were not advanced.",
+            ok=False, notify=False, secret=secret,
+        )
     bad = _saved_query_ok(state)
     if bad:
         return reply(bad, ok=False, notify=True, secret=secret, retryable=False)
@@ -905,327 +778,45 @@ def index_watch_check(runtime: Runtime) -> str:
     return _render_search(page, state["id_field"], state.get("title_field") or "", secret, watch=True, state=state, runtime=runtime)
 
 
-def _rewrite_risk(value: str) -> bool:
-    if any(ch in REWRITE_CHARS or ord(ch) < 32 or ord(ch) == 127 for ch in value):
-        return True
-    return bool(EMPHASIS_RE.search(value))
-
-
-def rewrite_message(field: str, action: str) -> str:
-    return (
-        f"The {REWRITE_LABELS[field]} cannot be shown unchanged in the approval text, "
-        f"so {action} was not asked. Seen ids were not changed."
-    )
-
-
-def _approval_question(kind: str, index: str, query: str, id_field: str, deliver: str, job_id: str = "") -> str:
-    if kind == "unschedule":
-        return (
-            f"Approve unschedule of an index watch. "
-            f"Index: {index}. Query: {query}. Id field: {id_field}. Delivery: {deliver}. "
-            f"This removes cron job {job_id}. Seen ids are kept."
-        )
-    return (
-        "Approve schedule of an index watch. "
-        f"Index: {index}. Query: {query}. Id field: {id_field}. Delivery: {deliver}. "
-        "This creates a cron job every 15 minutes that calls the model."
-    )
-
-
-def _fits(text: str) -> bool:
-    if len(text) > REASON_BUDGET:
-        return False
-    amp = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    if len(amp) > REASON_BUDGET:
-        return False
-    return len(html.escape(text, quote=True)) <= ESCAPED_REASON_BUDGET
-
-
-def _schedule_block(runtime: Runtime, action: str) -> str | None:
-    """Host process only. yolo, approvals off, cron, and unattended are Hermes's gate."""
-    del action
-    try:
-        host = runtime.host()
-    except Exception:
-        return MSG_CANNOT
-    if host not in (None, "", "0"):
-        return MSG_CANNOT
-    return None
-
-
-def _deliver_error(runtime: Runtime, value) -> str | None:
-    if not isinstance(value, str) or value.strip() == "":
-        return "Delivery is empty, so it was not treated as local."
-    raw = value.strip()
-    low = raw.lower()
-    if low in REFUSED_DELIVER or low.startswith("bot-chat:"):
-        return "That delivery target is refused."
-    if any(ch in raw for ch in "*@"):
-        return "Delivery must be a target, not a schedule."
-    if re.fullmatch(r"\d+", raw) or ISO_RE.match(raw):
-        return "Delivery must be a target, not a schedule."
-    tokens = re.split(r"[\s,]+", low)
-    if any(token in SCHEDULE_TOKENS or re.fullmatch(r"\d+m", token) for token in tokens):
-        return "Delivery must be a target, not a schedule."
-    if "," in raw:
-        return "Delivery must be one target."
-    if low in PLAIN_DELIVER:
-        return None
-    if ":" in raw:
-        platform, chat = raw.split(":", 1)
-        if not platform or not chat or platform.lower() in REFUSED_DELIVER:
-            return "That delivery target is refused."
-        known = runtime.known_platform(platform)
-        if known is True:
-            return None
-        if known is None:
-            return "Delivery could not be checked, so no job was created."
-        return "That delivery platform is not known to this Hermes."
-    known = runtime.known_platform(raw)
-    if known is True:
-        return None
-    if known is None:
-        return "Delivery could not be checked, so no job was created."
-    return "That delivery platform is not known to this Hermes."
-
-
-def _canonical_deliver(value: str) -> str:
-    raw = value.strip()
-    if raw.lower() in PLAIN_DELIVER:
-        return raw.lower()
-    return raw
-
-
-def _origin_plan(runtime: Runtime, deliver: str) -> tuple[dict | None, str, str | None]:
-    """Origin dict for create_job, a note for the success text, or an error.
-
-    origin, local, and all are already lowercase. A platform name is not.
-    """
-    if deliver != "origin":
-        return None, "", None
-    try:
-        found = runtime.session_origin(SCHEDULE_EXPR)
-    except Exception:
-        return None, "", MSG_ORIGIN_UNREADABLE
-    platform = found.get("platform") if isinstance(found, dict) else None
-    chat_id = found.get("chat_id") if isinstance(found, dict) else None
-    if isinstance(platform, str) and platform and isinstance(chat_id, str) and chat_id:
-        return found, f" Delivery returns to this session on {platform}.", None
-    return None, (
-        " Delivery origin was not captured. The job uses the home channel if one is set, "
-        "and nowhere if it is not. It does not return to this session."
-    ), None
-
-
-def one_call_rule_key(plan: dict) -> str:
-    """Hermes stores session and always under this key. The same plan matches; another does not."""
-    body = json.dumps(plan, sort_keys=True, separators=(",", ":"), default=str)
-    return "index_watch:" + hashlib.sha256(body.encode()).hexdigest()[:16]
-
-
-_LOCK = threading.Lock()
-_STASH: dict[tuple, tuple[str, float]] = {}
-_STASH_TTL = 600
-
-
-def _ids(kwargs: dict) -> tuple[str, str]:
-    return (str(kwargs.get("session_id") or ""), str(kwargs.get("task_id") or ""))
-
-
-def _stash_key(payload: dict, ids: tuple[str, str]) -> tuple:
-    fields = {str(key): payload[key] for key in payload}
-    return ("index_watch", json.dumps(fields, sort_keys=True, default=str), ids[0], ids[1])
-
-
-def remember_watch(payload: dict, ids: tuple[str, str], question: str) -> None:
-    with _LOCK:
-        _STASH[_stash_key(payload, ids)] = (question, time.monotonic())
-
-
-def take_watch(payload: dict, ids: tuple[str, str], question: str) -> str | None:
-    """Pop this call's question. Missing, stale, or different means do not create or remove the job."""
-    with _LOCK:
-        found = _STASH.pop(_stash_key(payload, ids), None)
-    if found is None:
-        return "The watch change was not approved. Seen ids were not changed."
-    stored, made = found
-    if time.monotonic() - made > _STASH_TTL:
-        return "BLOCKED: the approval is too old. Seen ids were not changed."
-    if stored != question:
-        return "The target changed after the preview. Seen ids were not changed."
-    return None
-
-
-def _host_blocked(runtime: Runtime) -> bool:
-    try:
-        host = runtime.host()
-    except Exception:
-        return True
-    return host not in (None, "", "0")
-
-
-def _preview_question(runtime: Runtime, data: dict) -> tuple[str, str] | None:
-    """The approval line and its stable rule key, or None when this call would not ask."""
-    if _host_blocked(runtime):
-        return None
-    action = data.get("action")
-    shown: list[tuple[str, str]]
-    if action == "schedule":
-        allowed = {"action", "index", "q", "id_field", "title_field", "deliver"}
-        if set(data) - allowed:
-            return None
-        if not _uid_ok(data.get("index")) or not _query_ok(data.get("q")) or not _field_ok(data.get("id_field")):
-            return None
-        if "title_field" in data and data.get("title_field") not in (None, ""):
-            if not _field_ok(data.get("title_field")):
-                return None
-        if _deliver_error(runtime, data.get("deliver")):
-            return None
-        deliver = _canonical_deliver(data["deliver"])
-        _origin_for_job, _origin_note, origin_error = _origin_plan(runtime, deliver)
-        if origin_error:
-            return None
-        question = _approval_question("schedule", data["index"], data["q"], data["id_field"], deliver)
-        plan = {
-            "action": "schedule",
-            "deliver": deliver,
-            "id_field": data["id_field"],
-            "index": data["index"],
-            "q": data["q"],
-            "title_field": data.get("title_field") or "",
-        }
-        shown = [
-            ("index", data["index"]),
-            ("q", data["q"]),
-            ("id_field", data["id_field"]),
-            ("deliver", deliver),
-        ]
-    elif action == "unschedule":
-        if set(data) - {"action"}:
-            return None
-        kind, current = _watch_state(runtime)
-        if kind == "corrupt":
-            return None
-        state = store.normalize(current) if current else None
-        if state is None or not state.get("scheduled") or not (state.get("job_id") or ""):
-            return None
-        job_id = state.get("job_id") or ""
-        if _job_presence(runtime, job_id) != "present":
-            return None
-        if _form(runtime) == "cannot":
-            return None
-        index = state.get("index") or ""
-        query = state.get("q") or ""
-        id_field = state.get("id_field") or ""
-        deliver = state.get("deliver") or "local"
-        question = _approval_question(
-            "unschedule", index or "(none)", query or "(none)", id_field or "(none)", deliver, job_id,
-        )
-        plan = {
-            "action": "unschedule",
-            "deliver": deliver,
-            "id_field": id_field,
-            "index": index,
-            "job_id": job_id,
-            "q": query,
-        }
-        shown = [
-            ("index", index),
-            ("q", query),
-            ("id_field", id_field),
-            ("deliver", deliver),
-            ("job_id", job_id),
-        ]
-    else:
-        return None
-    for _field, value in shown:
-        if _rewrite_risk(value if isinstance(value, str) else ""):
-            return None
-    if not _fits(question):
-        return None
-    return question, one_call_rule_key(plan)
-
-
-def on_pre_tool_call(tool_name: str = "", args=None, **kwargs):
-    """Approve schedule and unschedule. Search, health, status, and check stay silent."""
-    if tool_name != "index_watch":
-        return None
-    # Every watch change in this session and task starts clean. Other rooms keep
-    # their own previews while they wait for an answer.
-    room = _ids(kwargs)
-    with _LOCK:
-        for key in [k for k in _STASH if k[2:] == room]:
-            del _STASH[key]
-    payload = dict(args) if isinstance(args, dict) else {}
-    if payload.get("action") not in ("schedule", "unschedule"):
-        return None
-    try:
-        runtime = live_runtime()
-    except Exception:
-        return None
-    found = _preview_question(runtime, payload)
-    if not found:
-        return None
-    question, rule_key = found
-    if "\n" in question or "`" in question:
-        return None
-    remember_watch(payload, _ids(kwargs), question)
-    return {"action": "approve", "message": question, "rule_key": rule_key}
-
-
 def _profile_name(runtime: Runtime) -> str | None:
     try:
         name = runtime.profile()
     except Exception:
         return None
-    if not isinstance(name, str) or not name.strip():
-        return None
-    return name
+    return clean_profile(name)
 
 
-def _lines(profile: str | None, job_id: str) -> str:
-    """Commands that still work after the plugin is removed. An empty job id drops the
-    remove line, because unschedule already removed that job."""
+def _hermes_prefix(profile: str) -> str:
+    if profile == "default":
+        return "hermes"
+    return f"hermes -p {profile}"
+
+
+def _watch_commands(profile: str | None, job_id: str) -> str:
+    """The lines the user runs. This plugin does not create or remove the job."""
     if profile is None:
-        return "profile unknown"
-    prefix = "hermes" if profile == "default" else f"hermes -p {profile}"
-    rows = [
-        f"{prefix} cron list",
-        f"{prefix} cron status",
-    ]
+        return "profile unknown."
+    prefix = _hermes_prefix(profile)
+    create = (
+        f'{prefix} cron create "every 15 minutes" "{JOB_PROMPT}" '
+        "--name index-search --deliver local"
+    )
+    rows = [create]
     if job_id:
-        rows.append(f"{prefix} cron remove {job_id}")
+        rows.append(
+            f"This plugin did not remove cron job {job_id}. "
+            f"Remove it with: {prefix} cron remove {job_id}"
+        )
     return "\n".join(rows)
 
 
-def _ask(runtime: Runtime, action: str, question: str, shown) -> str | None:
-    for field, value in shown:
-        if _rewrite_risk(value if isinstance(value, str) else ""):
-            return reply(rewrite_message(field, action), ok=False, notify=True, retryable=False)
-    if not _fits(question):
-        return reply(MSG_APPROVAL_FIT, ok=False, notify=True, retryable=False)
-    if getattr(runtime, "public_approval", False):
-        payload = runtime.approval_payload if isinstance(runtime.approval_payload, dict) else {}
-        ids = runtime.approval_ids if isinstance(runtime.approval_ids, tuple) else ("", "")
-        reason = take_watch(payload, ids, question)
-        if reason:
-            return reply(reason, ok=False, notify=True, retryable=False, isError=True)
-        return None
-    try:
-        result = runtime.request_approval(question)
-    except Exception:
-        return reply(MSG_CANNOT, ok=False, notify=True, retryable=False)
-    if not isinstance(result, dict) or result.get("approved") is not True:
-        return reply("The watch change was not approved. Seen ids were not changed.", ok=False, notify=True, retryable=False)
-    return None
-
-
-def _schedule(runtime: Runtime, data: dict) -> str:
+def _save(runtime: Runtime, data: dict) -> str:
     secret = _secret(runtime)
-    allowed = {"action", "index", "q", "id_field", "title_field", "deliver"}
+    allowed = {"action", "index", "q", "id_field", "title_field"}
     if set(data) - allowed:
         return reply(
-            "index_watch schedule takes only index, q, id_field, deliver, and an optional title_field.",
+            "Delivery is not a tool argument. Put --deliver on hermes cron create. "
+            "index_watch save takes only index, q, id_field, and an optional title_field.",
             ok=False, notify=True, secret=secret, retryable=False,
         )
     if not _uid_ok(data.get("index")):
@@ -1237,7 +828,6 @@ def _schedule(runtime: Runtime, data: dict) -> str:
             "The id field must be a non-empty string of 64 characters or fewer, without a dot, a slash, or a control character.",
             ok=False, notify=True, secret=secret, retryable=False,
         )
-    # An omitted title_field keeps the saved one. An empty string clears it.
     title_given = "title_field" in data and data.get("title_field") is not None
     title_field = ""
     if title_given and data.get("title_field") != "":
@@ -1247,22 +837,6 @@ def _schedule(runtime: Runtime, data: dict) -> str:
                 ok=False, notify=True, secret=secret, retryable=False,
             )
         title_field = data["title_field"]
-    deliver_error = _deliver_error(runtime, data.get("deliver"))
-    if deliver_error:
-        return reply(deliver_error, ok=False, notify=True, secret=secret, retryable=False)
-    deliver = _canonical_deliver(data["deliver"])
-    blocked = _schedule_block(runtime, "schedule")
-    if blocked:
-        return reply(blocked, ok=False, notify=True, secret=secret, retryable=False)
-    origin_for_job, origin_note, origin_error = _origin_plan(runtime, deliver)
-    if origin_error:
-        return reply(origin_error, ok=False, notify=True, secret=secret, retryable=False)
-    question = _approval_question("schedule", data["index"], data["q"], data["id_field"], deliver)
-    denied = _ask(runtime, "schedule", question, [
-        ("index", data["index"]), ("q", data["q"]), ("id_field", data["id_field"]), ("deliver", deliver),
-    ])
-    if denied:
-        return denied
     kind, current = _watch_state(runtime)
     if kind == "corrupt":
         return reply(
@@ -1270,45 +844,25 @@ def _schedule(runtime: Runtime, data: dict) -> str:
             ok=False, notify=True, secret=secret, retryable=False,
         )
     previous = store.normalize(current) if current else None
-    job_kwargs = {
-        "prompt": JOB_PROMPT,
-        "schedule": SCHEDULE_EXPR,
-        "name": "index-search",
-        "deliver": deliver,
-        "enabled_toolsets": [TOOLSET],
-        "no_agent": False,
-    }
-    if origin_for_job is not None:
-        job_kwargs["origin"] = origin_for_job
-    try:
-        created = runtime.create_job(**job_kwargs)
-    except Exception:
-        return reply(
-            "The cron job was not created. Seen ids were not changed.",
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    if not isinstance(created, dict) or not created.get("id"):
-        return reply(
-            "The cron job was not created. Seen ids were not changed.",
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    new_id = str(created["id"])
-    if previous:
+    same_identity = bool(previous) and (
+        previous.get("index"), previous.get("q"), previous.get("id_field"),
+    ) == (data["index"], data["q"], data["id_field"])
+    if previous and not title_given and same_identity:
+        title_field = previous.get("title_field") or ""
+    if previous and same_identity:
         seen = list(previous.get("seen") or [])
-        same_identity = (previous.get("index"), previous.get("q"), previous.get("id_field")) == (
-            data["index"], data["q"], data["id_field"],
-        )
-        if not title_given and same_identity:
-            title_field = previous.get("title_field") or ""
-        baseline_pending = False if same_identity else True
-        if not same_identity:
-            baseline_pending = True
-        last_empty = bool(previous.get("last_empty")) if same_identity else False
-        fail = previous.get("fail") if same_identity else None
-        over = previous.get("over") if same_identity else None
-        zero_told = bool(previous.get("zero_told")) if same_identity else False
-        if previous.get("baseline_pending"):
-            baseline_pending = True
+        baseline_pending = bool(previous.get("baseline_pending"))
+        last_empty = bool(previous.get("last_empty"))
+        fail = previous.get("fail")
+        over = previous.get("over")
+        zero_told = bool(previous.get("zero_told"))
+    elif previous:
+        seen = list(previous.get("seen") or [])
+        baseline_pending = True
+        last_empty = False
+        fail = None
+        over = None
+        zero_told = False
     else:
         seen = []
         baseline_pending = True
@@ -1316,14 +870,14 @@ def _schedule(runtime: Runtime, data: dict) -> str:
         fail = None
         over = None
         zero_told = False
-        same_identity = False
+    job_id = (previous or {}).get("job_id") or ""
     state = {
         "index": data["index"],
         "q": data["q"],
         "id_field": data["id_field"],
         "title_field": title_field,
-        "deliver": deliver,
-        "job_id": new_id,
+        "deliver": "",
+        "job_id": job_id,
         "scheduled": True,
         "baseline_pending": baseline_pending,
         "seen": seen,
@@ -1335,106 +889,39 @@ def _schedule(runtime: Runtime, data: dict) -> str:
     }
     written = store.save(runtime.data_dir, state, runtime.write_guard)
     if written != "ok":
-        try:
-            removed = runtime.remove_job(new_id)
-        except Exception:
-            removed = None
-        if removed is not True:
-            return reply(
-                f"The cron job {new_id} was created, but the watch file was not written. Seen ids were not changed.",
-                ok=False, notify=True, secret=secret, retryable=False,
-            )
-        return reply(MSG_SCHEDULE_NOT_WRITTEN, ok=False, notify=True, secret=secret, retryable=False)
-    old_id = (previous or {}).get("job_id") or ""
-    removed_note = ""
-    if old_id and old_id != new_id:
-        try:
-            removed_old = runtime.remove_job(old_id)
-        except Exception:
-            removed_old = None
-        if removed_old is not True:
-            removed_note = f" The previous job {old_id} was not confirmed removed."
-    lines = _lines(_profile_name(runtime), new_id)
-    previous_deliver = (previous or {}).get("deliver") or ""
-    if previous and same_identity and previous_deliver and previous_deliver != deliver and (previous.get("title_field") or "") == title_field:
-        lead = f"The previous delivery was {previous_deliver}. Seen ids were kept."
-    elif previous and not same_identity:
-        lead = "The next check saves a new baseline. This call did not search. Seen ids were kept."
-    elif previous and (previous.get("title_field") or "") != title_field and same_identity and previous_deliver == deliver:
-        lead = "The title field was updated. Seen ids were kept. This call did not search."
+        return reply(
+            "The watch file was not written. This call did not search and did not create a cron job. Seen ids were not changed.",
+            ok=False, notify=True, secret=secret, retryable=False,
+        )
+    shown_title = title_field or "(none)"
+    lead = (
+        f"Watch query saved. Index: {data['index']}. Query: {data['q']}. "
+        f"Id field: {data['id_field']}. Title field: {shown_title}. "
+        "This call did not search and did not create a cron job."
+    )
+    if previous and not same_identity:
+        lead += " The next check saves a new baseline. Seen ids were kept."
+    elif previous and same_identity and (previous.get("title_field") or "") != title_field:
+        lead += " The title field was updated. Seen ids were kept."
+    elif previous and same_identity:
+        lead += " Seen ids were kept."
+    lead += MSG_LIMIT
+    lines_out = _watch_commands(_profile_name(runtime), job_id)
+    if lines_out == "profile unknown.":
+        text = lead + " profile unknown."
     else:
-        lead = "Watch saved. This call did not search."
-    return reply(lead + MSG_LIMIT + origin_note + removed_note + "\n" + lines, ok=True, notify=True, secret=secret, job_id=new_id)
+        text = lead + "\n" + lines_out
+    return reply(text, ok=True, notify=True, secret=secret)
 
 
-def _unschedule(runtime: Runtime, data: dict) -> str:
+def _retired(runtime: Runtime, _data: dict) -> str:
     secret = _secret(runtime)
-    if set(data) - {"action"}:
-        return reply("index_watch unschedule takes no arguments.", ok=False, notify=True, secret=secret, retryable=False)
-    kind, current = _watch_state(runtime)
-    if kind == "corrupt":
-        return reply(
-            "The saved watch file is unreadable, so it was not overwritten.",
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    state = store.normalize(current) if current else None
-    if state is None or not state.get("scheduled") or not (state.get("job_id") or ""):
-        if state and state.get("job_gone"):
-            return reply(MSG_JOB_GONE_KEPT, ok=False, notify=True, secret=secret, retryable=False)
-        return reply(MSG_NOTHING_UNSCHEDULE, ok=True, notify=False, secret=secret)
-    job_id = state.get("job_id") or ""
-    # A cron session still refuses a live job before approval. A job that is already
-    # gone is reported first, so the result does not claim a watch is scheduled.
-    presence = _job_presence(runtime, job_id)
-    if presence == "gone":
-        return _mark_job_gone(runtime, state, secret, MSG_JOB_GONE_KEPT, notify=True, ok=False, retryable=False)
-    if presence == "unreadable":
-        return reply(MSG_JOB_UNKNOWN, ok=False, notify=True, secret=secret, retryable=False)
-    if _form(runtime) == "cannot":
-        lines = _lines(_profile_name(runtime), job_id)
-        return reply(
-            "This form cannot unschedule. The cron job is still there.\n"
-            + lines
-            + "\nSeen ids were not changed.",
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    blocked = _schedule_block(runtime, "unschedule")
-    if blocked:
-        return reply(blocked, ok=False, notify=True, secret=secret, retryable=False)
-    index = state.get("index") or ""
-    query = state.get("q") or ""
-    id_field = state.get("id_field") or ""
-    deliver = state.get("deliver") or "local"
-    question = _approval_question("unschedule", index or "(none)", query or "(none)", id_field or "(none)", deliver, job_id)
-    denied = _ask(runtime, "unschedule", question, [
-        ("index", index), ("q", query), ("id_field", id_field), ("deliver", deliver), ("job_id", job_id),
-    ])
-    if denied:
-        return denied
-    try:
-        removed = runtime.remove_job(job_id)
-    except Exception:
-        return reply(
-            "The cron job was not removed. Seen ids were not changed.",
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    if removed is not True:
-        return reply(
-            "The cron job was not confirmed removed. Seen ids were kept.",
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    state["scheduled"] = False
-    state["job_id"] = ""
-    written = store.save(runtime.data_dir, state, runtime.write_guard)
-    if written != "ok":
-        return reply(
-            MSG_UNSCHEDULE_NOT_WRITTEN.format(job_id=job_id),
-            ok=False, notify=True, secret=secret, retryable=False,
-        )
-    lines = _lines(_profile_name(runtime), "")
     return reply(
-        f"The cron job {job_id} was removed. Seen ids were kept.\n" + lines,
-        ok=True, notify=True, secret=secret,
+        "This action does not create or remove a cron job. "
+        "Save the query with action save. "
+        "You create the watch with hermes cron create and remove it with hermes cron remove. "
+        "Seen ids were not changed.",
+        ok=False, notify=True, secret=secret, retryable=False,
     )
 
 
@@ -1449,28 +936,28 @@ def _status(runtime: Runtime, data: dict) -> str:
             ok=False, notify=True, secret=secret,
         )
     if kind != "ready":
-        if current and current.get("job_gone"):
-            return reply("The cron job is gone.", ok=True, notify=False, secret=secret, scheduled=False)
-        return reply("No watch is scheduled.", ok=True, notify=False, secret=secret, scheduled=False)
+        return reply("No watch query is saved.", ok=True, notify=False, secret=secret, scheduled=False)
     state = current
-    presence = _job_presence(runtime, state.get("job_id") or "")
-    if presence == "gone":
-        return _mark_job_gone(runtime, state, secret, "The cron job is gone.", notify=False, ok=True)
-    if presence == "unreadable":
-        return reply(MSG_JOB_UNKNOWN, ok=False, notify=True, secret=secret, scheduled=False)
+    title = state.get("title_field") or "(none)"
+    lead = (
+        f"A watch query is saved. Index: {state.get('index')}. Query: {state.get('q')}. "
+        f"Id field: {state.get('id_field')}. Title field: {title}."
+    )
+    lines_out = _watch_commands(_profile_name(runtime), state.get("job_id") or "")
+    if lines_out == "profile unknown.":
+        text = lead + " profile unknown."
+    else:
+        text = lead + "\n" + lines_out
     return reply(
-        "A watch is scheduled.",
+        text,
         ok=True, notify=False, secret=secret, scheduled=True,
         index=state.get("index"), q=state.get("q"), id_field=state.get("id_field"),
-        title_field=state.get("title_field") or "", deliver=state.get("deliver") or "",
-        seen=len(state.get("seen") or []),
+        title_field=state.get("title_field") or "",
     )
 
 
 def index_watch(runtime: Runtime, args, **kwargs) -> str:
-    if getattr(runtime, "public_approval", False):
-        runtime.approval_payload = dict(args) if isinstance(args, dict) else {}
-        runtime.approval_ids = (str(kwargs.get("session_id") or ""), str(kwargs.get("task_id") or ""))
+    del kwargs
     data = _as_dict(args)
     secret = _secret(runtime)
     if data is None:
@@ -1488,10 +975,10 @@ def index_watch(runtime: Runtime, args, **kwargs) -> str:
         if set(data) - {"action"}:
             return reply("index_watch check takes no arguments.", ok=False, notify=True, secret=secret, retryable=False)
         return index_watch_check(runtime)
-    if action == "schedule":
-        return _schedule(runtime, data)
-    if action == "unschedule":
-        return _unschedule(runtime, data)
+    if action == "save":
+        return _save(runtime, data)
+    if action in {"schedule", "unschedule"}:
+        return _retired(runtime, data)
     if action == "status":
         return _status(runtime, data)
     return reply(MSG_ACTION, ok=False, notify=True, secret=secret, retryable=False)

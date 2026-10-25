@@ -93,4 +93,4 @@ def test_a_missing_host_names_health_and_a_bad_action_names_status(tmp_path):
     assert bad["ok"] is False and "action status" in bad["message"]
     assert bad["message"].index("action status") < bad["message"].index("日本語")
     status = json.loads(service.index_watch(hosted, {"action": "status"}))
-    assert status["ok"] is True and status["message"] == "No watch is scheduled."
+    assert status["ok"] is True and status["message"] == "No watch query is saved."

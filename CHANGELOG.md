@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4
+
+index_watch save stores one query and prints the hermes cron create line. You create that job and you remove it with hermes cron remove. This plugin does not. schedule and unschedule do not create or remove a job. There is no pre_tool_call hook, so the plugin does not ask. The save result names the title field. An older cron job id is named on a hermes cron remove line and is not deleted here. Each Hermes module is named in the source. The printed profile is ctx.profile_name from register. Writes still go through agent.file_safety. The README states version 0.1.4.
+
 ## 0.1.3
 
 The manifest lists the pre_tool_call hook that schedule and unschedule already register. Hermes shows that one approve line. Search, health, status, and check still return nothing from the hook. The README states version 0.1.3.

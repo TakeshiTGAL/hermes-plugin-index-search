@@ -13,20 +13,16 @@ def _load_service():
 
 def register(ctx) -> None:
     service = _load_service()
+    profile = service.clean_profile(getattr(ctx, "profile_name", None))
 
     def _search(args, **_kwargs):
-        return service.index_search(service.live_runtime(), args or {})
+        return service.index_search(service.live_runtime(profile), args or {})
 
     def _health(args, **_kwargs):
-        return service.index_health(service.live_runtime(), args or {})
+        return service.index_health(service.live_runtime(profile), args or {})
 
-    def _watch(args, **kwargs):
-        return service.index_watch(
-            service.live_runtime(),
-            args or {},
-            session_id=kwargs.get("session_id") or "",
-            task_id=kwargs.get("task_id") or "",
-        )
+    def _watch(args, **_kwargs):
+        return service.index_watch(service.live_runtime(profile), args or {})
 
     ctx.register_tool(
         name="index_search",
@@ -72,27 +68,24 @@ def register(ctx) -> None:
             "name": "index_watch",
             "description": (
                 "Meilisearch watch: new hits for one saved query. "
-                "Watch one saved query. schedule and unschedule ask for approval every time. "
-                "check reads the saved watch. A cron run with no arguments is check. "
+                "save stores the query and prints the hermes cron create line. "
+                "This plugin does not create the cron job and does not ask. "
+                "status reads the saved query. check reads new hits. A cron run with no arguments is check. "
                 "Seen ids advance only when check is a proven cron run and this plugin is not isolated."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["schedule", "unschedule", "status", "check"]},
+                    "action": {"type": "string", "enum": ["save", "status", "check"]},
                     "index": {"type": "string"},
                     "q": {"type": "string"},
                     "id_field": {"type": "string"},
                     "title_field": {"type": "string"},
-                    "deliver": {"type": "string", "description": "origin, local, all, a known platform, or platform:chat_id."},
                 },
             },
         },
         handler=_watch,
     )
-    register_hook = getattr(ctx, "register_hook", None)
-    if callable(register_hook):
-        register_hook("pre_tool_call", service.on_pre_tool_call)
     try:
         from pathlib import Path
         ctx.register_skill(

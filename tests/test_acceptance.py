@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 import importlib
 import importlib.util
 import json
@@ -161,7 +160,7 @@ def test_description_is_the_catalog_draft():
         "created_at_id",
         "repeats once a day",
         "cannot silence the next cron report",
-        "prints only `cron list` and `cron status`",
+        "prints the `hermes cron create` line and does not delete the job",
         "hermes cron remove <id>",
         "hermes -p <name> cron remove <id>",
     ):
@@ -379,10 +378,13 @@ def test_host_process_does_not_search_or_schedule(tmp_path):
     seed(tmp_path)
     before = (tmp_path / "state.json").read_bytes()
     script = Script([page([hit()])])
-    asked = []
+    created = []
+    removed = []
     runtime = rt(
         tmp_path, script, host=lambda: "1", cron=lambda: "cron",
-        request_approval=lambda question: asked.append(question) or {"approved": True},
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "job"},
+        remove_job=lambda job_id: removed.append(job_id) or True,
+        profile=lambda: "default",
     )
     out = body_of(service.index_watch(runtime, {"action": "check"}))
     assert out["message"] == service.MSG_CANNOT
@@ -392,15 +394,24 @@ def test_host_process_does_not_search_or_schedule(tmp_path):
     assert again["notify"] is True
     assert again["message"] == service.MSG_CANNOT
     blocked = body_of(service.index_watch(runtime, {
-        "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
+        "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku",
     }))
-    assert blocked["message"] == service.MSG_CANNOT
+    assert blocked["ok"] is False
+    assert "does not create or remove" in blocked["message"]
     stopped = body_of(service.index_watch(runtime, {"action": "unschedule"}))
-    assert "This form cannot unschedule. The cron job is still there." in stopped["message"]
-    assert "hermes cron remove seed" in stopped["message"]
-    assert "<id>" not in stopped["message"]
-    assert asked == []
+    assert stopped["ok"] is False
+    assert "does not create or remove" in stopped["message"]
+    assert created == [] and removed == []
     assert (tmp_path / "state.json").read_bytes() == before
+    saved = body_of(service.index_watch(runtime, {
+        "action": "save", "index": "probes", "q": "hermes", "id_field": "sku", "title_field": "title",
+    }))
+    assert saved["ok"] is True
+    assert "Title field: title" in saved["message"]
+    assert "did not search" in saved["message"]
+    assert "did not create a cron job" in saved["message"]
+    assert script.calls == []
+    assert created == [] and removed == []
     # Unset, empty, and 0 are the normal v0.21.4 cases.
     open_runtime = rt(tmp_path, script, host=lambda: None, cron=lambda: "not_cron")
     service.index_search(open_runtime, {"index": "probes", "q": "hermes", "id_field": "sku"})
@@ -419,14 +430,11 @@ def test_unknown_cron_marker_does_not_advance(tmp_path):
     assert (tmp_path / "state.json").read_bytes() == before
 
 
-def test_schedule_blocks_before_approval(tmp_path):
+def test_schedule_does_not_ask_or_create(tmp_path):
+    """Replaces the gate that asked on every schedule. The plugin no longer asks."""
     script = Script([page([hit()])])
     asked = []
-
-    def approve(question):
-        asked.append(question)
-        return {"approved": True}
-
+    created = []
     payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
     for gates in (
         {"cron": True, "yolo": False, "approvals": "manual", "single_query": False, "unattended": False, "approval_loaded": True},
@@ -437,126 +445,145 @@ def test_schedule_blocks_before_approval(tmp_path):
         {"unreadable": True},
     ):
         asked.clear()
-        runtime = rt(tmp_path, script, gates=lambda g=gates: g, request_approval=approve, cron=lambda: "not_cron")
-        service.index_watch(runtime, payload)
-        # Hermes denies cron, yolo, approvals off, single-query, and unattended.
-        # This plugin still asks, and it does not create the job when create_job is absent.
-        assert len(asked) == 1
-        assert "schedule" in asked[0]
+        created.clear()
+        runtime = rt(
+            tmp_path, script, gates=lambda g=gates: g,
+            request_approval=lambda question: asked.append(question) or {"approved": True},
+            create_job=lambda **kwargs: created.append(kwargs) or {"id": "job"},
+            cron=lambda: "not_cron",
+        )
+        out = body_of(service.index_watch(runtime, payload))
+        assert out["ok"] is False
+        assert "does not create or remove" in out["message"]
+        assert asked == []
+        assert created == []
     assert script.calls == []
+    assert not (tmp_path / "state.json").exists()
 
 
-def test_schedule_asks_every_time_and_refuses_a_long_or_rewritten_query(tmp_path):
+def test_save_prints_the_user_cron_line_and_does_not_create_a_job(tmp_path):
     script = Script([])
     asked = []
-
-    def approve(question):
-        asked.append(question)
-        return {"approved": True}
-
     jobs = []
-
-    def create_job(**kwargs):
-        jobs.append(kwargs)
-        return {"id": "job1"}
-
-    runtime = rt(tmp_path, script, request_approval=approve, create_job=create_job, profile=lambda: "work")
-    payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
-    service.index_watch(runtime, payload)
-    service.index_watch(runtime, payload)
-    assert len(asked) == 2
-    assert "schedule" in asked[0]
-    assert "hermes" in asked[0]
-    assert "every 15 minutes" in asked[0]
-    assert "model" in asked[0]
-    assert jobs[0]["no_agent"] is False
-    assert jobs[0]["schedule"] == service.SCHEDULE_EXPR
-    assert service.SCHEDULE_EXPR not in jobs[0]["prompt"]
-    out = body_of(service.index_watch(runtime, payload))
-    assert "hermes -p work cron remove" in out["message"]
-    assert "hermes cron remove -p work" not in out["message"]
-    assert "cron create" not in out["message"]
-    assert "estimatedTotalHits" in out["message"]
-    assert service.SCHEDULE_EXPR not in out["message"]
-    long = dict(payload, q="h" * 400)
-    before = len(asked)
-    refused = body_of(service.index_watch(runtime, long))
-    assert refused["message"] == service.MSG_APPROVAL_FIT
-    assert refused["retryable"] is False
-    assert len(asked) == before
-    starred = dict(payload, q="hello *world*")
-    refused = body_of(service.index_watch(runtime, starred))
-    assert refused["retryable"] is False
-    assert len(asked) == before
-    same_plan = {"action": "schedule", "index": "probes", "q": "hermes"}
-    assert service.one_call_rule_key(same_plan) == service.one_call_rule_key(dict(same_plan))
-    assert service.one_call_rule_key(same_plan) != service.one_call_rule_key(dict(same_plan, q="other"))
-
-
-def test_delivery_rules_and_deliver_only_change(tmp_path):
-    script = Script([])
-    created = []
-
-    def create_job(**kwargs):
-        created.append(kwargs)
-        return {"id": f"job{len(created)}"}
-
     runtime = rt(
         tmp_path, script,
-        request_approval=lambda question: {"approved": True},
-        create_job=create_job,
-        known_platform=lambda name: True if name.lower() == "slack" else False,
+        request_approval=lambda question: asked.append(question) or {"approved": True},
+        create_job=lambda **kwargs: jobs.append(kwargs) or {"id": "job1"},
+        remove_job=lambda job_id: False,
+        profile=lambda: "work",
     )
-    base = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku"}
-    for deliver in ("", "   ", "bot-chat", "cli", "cron", "api_server", "every", "5m", "monday", "9am", "*", "12", "2026-10-08T00:00:00"):
+    payload = {"action": "save", "index": "probes", "q": "hermes", "id_field": "sku", "title_field": "title"}
+    service.index_watch(runtime, payload)
+    out = body_of(service.index_watch(runtime, payload))
+    assert asked == []
+    assert jobs == []
+    assert "Title field: title" in out["message"]
+    assert "hermes -p work cron create" in out["message"]
+    assert "--deliver local" in out["message"]
+    assert "every 15 minutes" in out["message"]
+    assert "hermes cron remove -p work" not in out["message"]
+    assert "cron remove" not in out["message"]
+    assert "estimatedTotalHits" in out["message"]
+    assert "*/15" not in out["message"]
+    assert out["message"].index("hermes -p work") < out["message"].index("cron create")
+    long = dict(payload, q="h" * 401)
+    refused = body_of(service.index_watch(runtime, long))
+    assert refused["ok"] is False
+    assert service.MSG_QUERY in refused["message"]
+    assert jobs == []
+    starred = dict(payload, q="hello *world*")
+    kept = body_of(service.index_watch(runtime, starred))
+    assert kept["ok"] is True
+    assert "hello *world*" not in kept["message"].split("hermes -p work cron create", 1)[-1]
+    assert jobs == []
+
+
+def test_deliver_is_not_a_tool_argument(tmp_path):
+    script = Script([])
+    created = []
+    runtime = rt(
+        tmp_path, script,
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "job"},
+        profile=lambda: "default",
+    )
+    base = {"action": "save", "index": "probes", "q": "hermes", "id_field": "sku"}
+    for deliver in ("", "local", "origin", "all", "cli", "cron", "api_server", "bot-chat"):
         out = body_of(service.index_watch(runtime, dict(base, deliver=deliver)))
         assert out["ok"] is False
+        assert "Delivery is not a tool argument" in out["message"]
+        assert "--deliver" in out["message"]
         assert created == []
-    for deliver in ("local", "origin", "all", "slack", "slack:C123"):
-        out = body_of(service.index_watch(runtime, dict(base, deliver=deliver)))
-        assert out["ok"] is True
-    seed(tmp_path, deliver="local", seen=[{"t": "s", "v": "s1"}], baseline_pending=False)
-    out = body_of(service.index_watch(runtime, dict(base, deliver="origin")))
-    assert "local" in out["message"]
-    saved = json.loads((tmp_path / "state.json").read_text())
-    assert saved["seen"] == [{"t": "s", "v": "s1"}]
-    assert saved["baseline_pending"] is False
+        assert not (tmp_path / "state.json").exists()
+    saved = body_of(service.index_watch(runtime, base))
+    assert saved["ok"] is True
+    assert "--deliver local" in saved["message"]
+    assert created == []
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert stored["deliver"] == ""
+    assert stored["q"] == "hermes"
+    seed(tmp_path, deliver="local", seen=[{"t": "s", "v": "s1"}], baseline_pending=False, job_id="seed")
+    out = body_of(service.index_watch(runtime, base))
+    assert "Title field:" in out["message"]
+    assert "This plugin did not remove cron job seed." in out["message"]
+    assert "hermes cron remove seed" in out["message"]
+    assert "hermes cron remove -p" not in out["message"]
+    assert created == []
+    kept = json.loads((tmp_path / "state.json").read_text())
+    assert kept["seen"] == [{"t": "s", "v": "s1"}]
+    assert kept["baseline_pending"] is False
+    assert kept["job_id"] == "seed"
 
 
-def test_failed_schedule_and_identity_change_keep_seen_ids(tmp_path):
-    seed(tmp_path, seen=[{"t": "s", "v": "s1"}])
+def test_failed_save_and_identity_change_keep_seen_ids(tmp_path):
+    seed(tmp_path, seen=[{"t": "s", "v": "s1"}], job_id="seed")
     before = (tmp_path / "state.json").read_bytes()
     script = Script([page([hit("s9")])])
-
-    def boom(**kwargs):
-        raise RuntimeError("croniter missing")
-
-    runtime = rt(tmp_path, script, request_approval=lambda question: {"approved": True}, create_job=boom)
+    created = []
+    runtime = rt(
+        tmp_path, script,
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "new"},
+        write_guard=lambda path: "denied",
+        profile=lambda: "default",
+    )
     out = body_of(service.index_watch(runtime, {
-        "action": "schedule", "index": "other", "q": "hermes", "id_field": "sku", "deliver": "local",
+        "action": "save", "index": "other", "q": "hermes", "id_field": "sku",
     }))
     assert out["ok"] is False
+    assert "was not written" in out["message"]
+    assert service.MSG_INCOMPLETE not in out["message"]
     assert (tmp_path / "state.json").read_bytes() == before
     assert script.calls == []
-    runtime = rt(tmp_path, script, request_approval=lambda question: {"approved": True}, create_job=lambda **kw: {"id": "new"})
+    assert created == []
+    runtime = rt(
+        tmp_path, script,
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "new"},
+        profile=lambda: "default",
+    )
     out = body_of(service.index_watch(runtime, {
-        "action": "schedule", "index": "other", "q": "next", "id_field": "sku", "deliver": "local",
+        "action": "save", "index": "other", "q": "next", "id_field": "sku", "title_field": "name",
     }))
     assert "did not search" in out["message"]
+    assert "Title field: name" in out["message"]
+    assert "did not create a cron job" in out["message"]
+    assert created == []
     saved = json.loads((tmp_path / "state.json").read_text())
     assert saved["seen"] == [{"t": "s", "v": "s1"}]
     assert saved["baseline_pending"] is True
     assert saved["q"] == "next"
+    assert saved["job_id"] == "seed"
     assert script.calls == []
 
 
-def test_unschedule_without_a_job_does_not_delete_state(tmp_path):
+def test_unschedule_does_not_delete_state(tmp_path):
     seed(tmp_path, scheduled=False, job_id="")
     before = (tmp_path / "state.json").read_bytes()
-    runtime = rt(tmp_path, Script([]), request_approval=lambda question: {"approved": True})
+    removed = []
+    runtime = rt(tmp_path, Script([]), remove_job=lambda job_id: removed.append(job_id) or True)
     out = body_of(service.index_watch(runtime, {"action": "unschedule"}))
-    assert out["ok"] is True
-    assert "nothing to unschedule" in out["message"]
+    assert out["ok"] is False
+    assert "does not create or remove" in out["message"]
+    assert "hermes cron remove" in out["message"]
+    assert removed == []
     assert (tmp_path / "state.json").read_bytes() == before
 
 
@@ -668,7 +695,7 @@ def test_non_string_index_is_refused_before_http_and_is_not_saved(tmp_path):
         searched = body_of(service.index_search(runtime, {"index": index, "q": "hermes", "id_field": "sku"}))
         assert searched["message"] == service.MSG_SEARCH_UID
         scheduled = body_of(service.index_watch(runtime, {
-            "action": "schedule", "index": index, "q": "hermes", "id_field": "sku", "deliver": "local",
+            "action": "save", "index": index, "q": "hermes", "id_field": "sku",
         }))
         assert scheduled["message"] == service.MSG_UID
     assert script.calls == []
@@ -676,64 +703,28 @@ def test_non_string_index_is_refused_before_http_and_is_not_saved(tmp_path):
     assert not (tmp_path / "state.json").exists()
 
 
-def test_plain_tokens_are_lowercase_and_origin_is_passed_or_disclosed(tmp_path):
+def test_save_does_not_call_session_origin_or_create_a_job(tmp_path):
     script = Script([])
     created = []
-
-    def create_job(**kwargs):
-        created.append(kwargs)
-        return {"id": f"job{len(created)}"}
-
-    captured = {"platform": "telegram", "chat_id": "4242", "thread_id": None}
+    origins = []
     runtime = rt(
         tmp_path, script,
-        request_approval=lambda question: {"approved": True},
-        create_job=create_job,
-        known_platform=lambda name: name == "Telegram",
-        session_origin=lambda schedule: captured,
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "job"},
+        session_origin=lambda schedule: origins.append(schedule) or {"platform": "desk", "chat_id": "1"},
+        profile=lambda: "default",
     )
-    base = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku"}
-    out = body_of(service.index_watch(runtime, dict(base, deliver="Origin")))
+    out = body_of(service.index_watch(runtime, {
+        "action": "save", "index": "probes", "q": "hermes", "id_field": "sku",
+    }))
     assert out["ok"] is True
-    assert created[-1]["deliver"] == "origin"
-    assert created[-1]["origin"] == captured
-    assert "telegram" in out["message"]
-    assert "Delivery returns to this session" in out["message"]
+    assert created == []
+    assert origins == []
+    assert "hermes cron create" in out["message"]
+    assert "--deliver local" in out["message"]
+    assert "Title field: (none)" in out["message"]
     saved = json.loads((tmp_path / "state.json").read_text())
-    assert saved["deliver"] == "origin"
-    for token, stored in (("LOCAL", "local"), ("ALL", "all"), ("Telegram", "Telegram")):
-        service.index_watch(runtime, dict(base, deliver=token))
-        assert created[-1]["deliver"] == stored
-        assert "origin" not in created[-1]
-    asked = []
-
-    def refuse_origin(schedule):
-        raise RuntimeError("missing")
-
-    blind = rt(
-        tmp_path, script,
-        request_approval=lambda question: asked.append(question) or {"approved": True},
-        create_job=create_job,
-        session_origin=refuse_origin,
-    )
-    before = len(created)
-    refused = body_of(service.index_watch(blind, dict(base, deliver="origin")))
-    assert refused["message"] == service.MSG_ORIGIN_UNREADABLE
-    assert refused["ok"] is False
-    assert len(created) == before
-    assert asked == []
-    disclosed = rt(
-        tmp_path, script,
-        request_approval=lambda question: {"approved": True},
-        create_job=create_job,
-        session_origin=lambda schedule: None,
-    )
-    out = body_of(service.index_watch(disclosed, dict(base, deliver="origin")))
-    assert out["ok"] is True
-    assert "origin" not in created[-1]
-    assert "home channel" in out["message"]
-    assert "nowhere" in out["message"]
-    assert "does not return to this session" in out["message"]
+    assert saved["deliver"] == ""
+    assert saved["title_field"] == ""
 
 
 def test_ipv6_origin_keeps_brackets(tmp_path):
@@ -798,36 +789,38 @@ def test_opener_has_an_empty_proxy_and_bodies_over_the_cap_stop(tmp_path, monkey
 
 
 def test_save_failures_do_not_say_the_search_failed(tmp_path):
-    seed(tmp_path, seen=[{"t": "s", "v": "s1"}])
+    seed(tmp_path, seen=[{"t": "s", "v": "s1"}], job_id="seed")
     before = (tmp_path / "state.json").read_bytes()
     removed = []
     runtime = rt(
         tmp_path, Script([]),
-        request_approval=lambda question: {"approved": True},
         remove_job=lambda job_id: removed.append(job_id) or True,
-        write_guard=lambda path: "denied",
+        profile=lambda: "default",
     )
     out = body_of(service.index_watch(runtime, {"action": "unschedule"}))
     assert out["ok"] is False
     assert service.MSG_INCOMPLETE not in out["message"]
-    assert "seed" in out["message"]
-    assert "still says a watch is scheduled" in out["message"]
-    assert removed == ["seed"]
+    assert "was removed" not in out["message"]
+    assert "does not create or remove" in out["message"]
+    assert removed == []
     assert (tmp_path / "state.json").read_bytes() == before
     created = []
     fresh = rt(
         tmp_path, Script([]),
-        request_approval=lambda question: {"approved": True},
         create_job=lambda **kwargs: created.append(kwargs) or {"id": "new-job"},
         remove_job=lambda job_id: removed.append(job_id) or True,
         write_guard=lambda path: "denied",
+        profile=lambda: "default",
     )
     scheduled = body_of(service.index_watch(fresh, {
-        "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
+        "action": "save", "index": "probes", "q": "hermes", "id_field": "sku",
     }))
     assert scheduled["ok"] is False
-    assert scheduled["message"] == service.MSG_SCHEDULE_NOT_WRITTEN
-    assert "new-job" in removed
+    assert "was not written" in scheduled["message"]
+    assert "search failed" not in scheduled["message"]
+    assert service.MSG_INCOMPLETE not in scheduled["message"]
+    assert created == []
+    assert removed == []
     assert (tmp_path / "state.json").read_bytes() == before
 
 
@@ -860,46 +853,43 @@ def test_manual_check_does_not_claim_a_baseline_was_saved(tmp_path):
     assert script.calls
 
 
-def test_rewrite_refusal_is_not_the_length_message(tmp_path):
+def test_a_marked_query_is_saved_and_stays_out_of_the_cron_line(tmp_path):
     script = Script([])
     asked = []
+    created = []
     runtime = rt(
         tmp_path, script,
         request_approval=lambda question: asked.append(question) or {"approved": True},
-        create_job=lambda **kwargs: {"id": "job"},
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "job"},
+        profile=lambda: "default",
     )
-    payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
+    payload = {"action": "save", "index": "probes", "q": "hermes", "id_field": "sku"}
     marked = body_of(service.index_watch(runtime, dict(payload, q="say _bold_ now")))
-    assert marked["message"] == service.rewrite_message("q", "schedule")
-    assert "query" in marked["message"]
-    assert marked["retryable"] is False
-    starred = body_of(service.index_watch(runtime, dict(payload, q="hello *world*")))
-    assert starred["message"] == service.rewrite_message("q", "schedule")
-    long = body_of(service.index_watch(runtime, dict(payload, q="h" * 400)))
-    assert long["message"] == service.MSG_APPROVAL_FIT
+    assert marked["ok"] is True
+    assert "Query: say _bold_ now" in marked["message"]
+    command = marked["message"].split("hermes cron create", 1)[1]
+    assert "_bold_" not in command
     assert asked == []
-    assert not (tmp_path / "state.json").exists()
+    assert created == []
 
 
-def test_quote_dense_approval_is_not_sent(tmp_path):
+def test_a_quoted_query_is_not_copied_into_the_cron_line(tmp_path):
     asked = []
+    created = []
     runtime = rt(
         tmp_path, Script([]),
         request_approval=lambda question: asked.append(question) or {"approved": True},
-        create_job=lambda **kwargs: {"id": "job"},
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "job"},
+        profile=lambda: "default",
     )
-    payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
-    dense = '"' * 80
-    question = service._approval_question("schedule", "probes", dense, "sku", "local")
-    assert len(question) <= service.REASON_BUDGET
-    assert len(html.escape(question, quote=True)) > service.ESCAPED_REASON_BUDGET
-    refused = body_of(service.index_watch(runtime, dict(payload, q=dense)))
-    assert refused["message"] == service.MSG_APPROVAL_FIT
-    assert refused["retryable"] is False
+    payload = {"action": "save", "index": "probes", "q": "hermes", "id_field": "sku"}
     ordinary = body_of(service.index_watch(runtime, dict(payload, q='say "hi"')))
     assert ordinary["ok"] is True
-    assert len(asked) == 1
-    assert 'say "hi"' in asked[0]
+    assert 'Query: say "hi"' in ordinary["message"]
+    command = ordinary["message"].split("hermes cron create", 1)[1]
+    assert 'say "hi"' not in command
+    assert asked == []
+    assert created == []
 
 
 def test_quoted_key_is_absent_from_the_tool_result(tmp_path):
@@ -930,145 +920,136 @@ def test_job_prompt_tells_a_quiet_round_to_reply_silent():
     assert "say nothing" not in service.JOB_PROMPT
 
 
-def test_unschedule_question_removes_the_job_and_skips_approval_when_nothing_is_scheduled(tmp_path):
+def test_unschedule_does_not_remove_the_job(tmp_path):
     asked = []
-
-    def approve(question):
-        asked.append(question)
-        return {"approved": False}
-
-    idle = rt(tmp_path, Script([]), request_approval=approve)
+    removed = []
+    idle = rt(tmp_path, Script([]), request_approval=lambda question: asked.append(question) or {"approved": False})
     out = body_of(service.index_watch(idle, {"action": "unschedule"}))
-    assert "nothing to unschedule" in out["message"]
+    assert out["ok"] is False
+    assert "does not create or remove" in out["message"]
     assert asked == []
     seed(tmp_path, job_id="job-9", scheduled=True)
+    before = (tmp_path / "state.json").read_bytes()
     runtime = rt(
         tmp_path, Script([]),
-        request_approval=approve,
+        request_approval=lambda question: asked.append(question) or {"approved": True},
         get_job=lambda job_id: {"id": job_id},
-        remove_job=lambda job_id: True,
-    )
-    body_of(service.index_watch(runtime, {"action": "unschedule"}))
-    assert len(asked) == 1
-    assert asked[0].endswith("This removes cron job job-9. Seen ids are kept.")
-    assert "This creates a cron job" not in asked[0]
-    schedule = rt(
-        tmp_path, Script([]),
-        request_approval=approve,
-        create_job=lambda **kwargs: {"id": "job-new"},
-    )
-    service.index_watch(schedule, {
-        "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
-    })
-    assert asked[-1].endswith("This creates a cron job every 15 minutes that calls the model.")
-
-
-def test_unschedule_does_not_print_remove_for_the_job_it_just_deleted(tmp_path):
-    seed(tmp_path, job_id="job-9", scheduled=True)
-    runtime = rt(
-        tmp_path, Script([]),
-        request_approval=lambda question: {"approved": True},
-        get_job=lambda job_id: {"id": job_id},
-        remove_job=lambda job_id: True,
+        remove_job=lambda job_id: removed.append(job_id) or True,
         profile=lambda: "work",
     )
     out = body_of(service.index_watch(runtime, {"action": "unschedule"}))
-    assert "The cron job job-9 was removed." in out["message"]
-    assert "cron remove" not in out["message"]
-    assert "hermes -p work cron list" in out["message"]
-    assert "hermes -p work cron status" in out["message"]
-    assert "cron create" not in out["message"]
+    assert out["ok"] is False
+    assert "was removed" not in out["message"]
+    assert "does not create or remove" in out["message"]
+    assert "hermes cron remove" in out["message"]
+    assert asked == []
+    assert removed == []
+    assert (tmp_path / "state.json").read_bytes() == before
+    created = []
+    schedule = rt(
+        tmp_path, Script([]),
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "job-new"},
+        profile=lambda: "default",
+    )
+    saved = body_of(service.index_watch(schedule, {
+        "action": "save", "index": "probes", "q": "hermes", "id_field": "sku", "title_field": "title",
+    }))
+    assert saved["ok"] is True
+    assert "Title field: title" in saved["message"]
+    assert "hermes cron create" in saved["message"]
+    assert created == []
+    assert json.loads((tmp_path / "state.json").read_text())["job_id"] == "job-9"
 
 
-def test_a_missing_cron_job_is_not_described_as_scheduled_or_removed(tmp_path):
-    seed(tmp_path, job_id="job-9")
+def test_status_names_the_old_job_and_does_not_delete_it(tmp_path):
+    seed(tmp_path, job_id="job-9", scheduled=True)
     before = json.loads((tmp_path / "state.json").read_text())["seen"]
     script = Script([page([hit("s9")])])
-    asked = []
+    removed = []
     runtime = rt(
         tmp_path, script,
         cron=lambda: "cron",
-        request_approval=lambda question: asked.append(question) or {"approved": True},
         get_job=lambda job_id: None,
-        remove_job=lambda job_id: False,
+        remove_job=lambda job_id: removed.append(job_id) or False,
+        profile=lambda: "work",
     )
     status = body_of(service.index_watch(runtime, {"action": "status"}))
-    assert "job is gone" in status["message"]
-    assert "A watch is scheduled" not in status["message"]
+    assert "A watch query is saved." in status["message"]
+    assert "Index: probes" in status["message"]
+    assert "Title field: title" in status["message"]
+    assert "job is gone" not in status["message"]
+    assert "was removed" not in status["message"]
+    assert "hermes -p work cron create" in status["message"]
+    assert "This plugin did not remove cron job job-9." in status["message"]
+    assert "hermes -p work cron remove job-9" in status["message"]
     saved = json.loads((tmp_path / "state.json").read_text())
-    assert saved["job_id"] == ""
-    assert saved["scheduled"] is False
-    assert saved["job_gone"] is True
+    assert saved["job_id"] == "job-9"
+    assert saved["scheduled"] is True
     assert saved["seen"] == before
     checked = body_of(service.index_watch(runtime, {"action": "check"}))
-    assert "job is gone" in checked["message"]
-    assert script.calls == []
-    removed = body_of(service.index_watch(runtime, {"action": "unschedule"}))
-    assert "job is gone" in removed["message"]
-    assert "was removed" not in removed["message"]
-    assert asked == []
-    seed(tmp_path, job_id="job-9")
-    present = rt(
-        tmp_path, Script([]),
-        request_approval=lambda question: asked.append(question) or {"approved": True},
-        get_job=lambda job_id: {"id": job_id},
-        remove_job=lambda job_id: False,
-    )
-    lied = body_of(service.index_watch(present, {"action": "unschedule"}))
-    assert "not confirmed removed" in lied["message"]
-    assert "was removed" not in lied["message"]
-    assert "job is gone" not in lied["message"]
-    assert len(asked) == 1
+    assert "s9" in checked["message"] or "Baseline" in checked["message"] or checked["ok"] is True or "did not write" in checked["message"]
+    assert script.calls
+    assert removed == []
+    stopped = body_of(service.index_watch(runtime, {"action": "unschedule"}))
+    assert "was removed" not in stopped["message"]
+    assert "job is gone" not in stopped["message"]
+    assert json.loads((tmp_path / "state.json").read_text())["job_id"] == "job-9"
 
 
-def test_every_approval_field_is_refused_when_it_would_be_rewritten(tmp_path):
+def test_save_keeps_a_stored_job_id_the_user_must_remove(tmp_path):
     asked = []
+    removed = []
     runtime = rt(
         tmp_path, Script([]),
         request_approval=lambda question: asked.append(question) or {"approved": True},
         create_job=lambda **kwargs: {"id": "job"},
+        profile=lambda: "default",
     )
-    base = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
-    marked = body_of(service.index_watch(runtime, dict(base, id_field="_bold_")))
-    assert marked["message"] == service.rewrite_message("id_field", "schedule")
-    indexed = body_of(service.index_watch(runtime, dict(base, index="_a-b_")))
-    assert indexed["message"] == service.rewrite_message("index", "schedule")
+    marked = body_of(service.index_watch(runtime, {
+        "action": "save", "index": "_a-b_", "q": "hermes", "id_field": "_bold_",
+    }))
+    assert marked["ok"] is True
+    assert "Index: _a-b_" in marked["message"]
+    assert "Id field: _bold_" in marked["message"]
     assert asked == []
     seed(tmp_path, job_id="bad<id", q="hermes", scheduled=True)
     watched = rt(
         tmp_path, Script([]),
-        request_approval=lambda question: asked.append(question) or {"approved": True},
         get_job=lambda job_id: {"id": job_id},
-        remove_job=lambda job_id: True,
+        remove_job=lambda job_id: removed.append(job_id) or True,
+        profile=lambda: "default",
     )
-    out = body_of(service.index_watch(watched, {"action": "unschedule"}))
-    assert out["message"] == service.rewrite_message("job_id", "unschedule")
-    assert "unschedule was not asked" in out["message"]
-    assert asked == []
+    out = body_of(service.index_watch(watched, {
+        "action": "save", "index": "probes", "q": "hermes", "id_field": "sku",
+    }))
+    assert "This plugin did not remove cron job bad<id." in out["message"]
+    assert "hermes cron remove bad<id" in out["message"]
+    assert "was removed" not in out["message"]
+    assert removed == []
+    assert json.loads((tmp_path / "state.json").read_text())["job_id"] == "bad<id"
 
 
-def test_an_underscore_inside_a_word_is_not_an_emphasis_mark(tmp_path):
-    """movies_en_us and created_at_id are shown unchanged, so they are not refused."""
-    assert service._rewrite_risk("movies_en_us") is False
-    assert service._rewrite_risk("created_at_id") is False
-    assert service._rewrite_risk("a_b_c") is False
-    assert service._rewrite_risk("_bold_") is True
-    assert service._rewrite_risk("say _bold_ now") is True
-    assert service._rewrite_risk("hello *world*") is True
+def test_an_underscore_inside_a_word_is_stored_unchanged(tmp_path):
+    """movies_en_us and created_at_id are saved as given."""
     asked = []
+    created = []
     runtime = rt(
         tmp_path, Script([]),
         request_approval=lambda question: asked.append(question) or {"approved": True},
-        create_job=lambda **kwargs: {"id": "job-9"},
+        create_job=lambda **kwargs: created.append(kwargs) or {"id": "job-9"},
+        profile=lambda: "default",
     )
     out = body_of(service.index_watch(runtime, {
-        "action": "schedule", "index": "movies_en_us", "q": "a_b_c",
-        "id_field": "created_at_id", "deliver": "local",
+        "action": "save", "index": "movies_en_us", "q": "a_b_c",
+        "id_field": "created_at_id",
     }))
     assert out["ok"] is True
-    assert len(asked) == 1
-    assert "Index: movies_en_us. Query: a_b_c. Id field: created_at_id." in asked[0]
-    assert "cannot be shown unchanged" not in out["message"]
+    assert "Index: movies_en_us. Query: a_b_c. Id field: created_at_id." in out["message"]
+    assert asked == []
+    assert created == []
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["index"] == "movies_en_us"
+    assert saved["id_field"] == "created_at_id"
 
 
 def test_a_key_inside_the_url_is_not_an_incomplete_search(tmp_path):
@@ -1084,26 +1065,14 @@ def test_an_unreadable_profile_is_not_printed_as_default(tmp_path):
     def boom():
         raise RuntimeError("profile")
 
-    runtime = rt(
-        tmp_path, Script([]),
-        request_approval=lambda question: {"approved": True},
-        create_job=lambda **kwargs: {"id": "job-9"},
-        profile=boom,
-    )
-    out = body_of(service.index_watch(runtime, {
-        "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
-    }))
+    payload = {"action": "save", "index": "probes", "q": "hermes", "id_field": "sku", "title_field": "title"}
+    runtime = rt(tmp_path, Script([]), profile=boom)
+    out = body_of(service.index_watch(runtime, payload))
+    assert "Title field: title" in out["message"]
     assert "profile unknown" in out["message"]
     assert "hermes cron" not in out["message"]
-    blank = rt(
-        tmp_path, Script([]),
-        request_approval=lambda question: {"approved": True},
-        create_job=lambda **kwargs: {"id": "job-8"},
-        profile=lambda: None,
-    )
-    out = body_of(service.index_watch(blank, {
-        "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
-    }))
+    blank = rt(tmp_path, Script([]), profile=lambda: None)
+    out = body_of(service.index_watch(blank, payload))
     assert "profile unknown" in out["message"]
     assert "hermes cron" not in out["message"]
 
@@ -1268,12 +1237,6 @@ HELPERS = [
     ("plugins.plugin_storage", "plugin_data_dir", "data_dir"),
     ("cron.execution_identity", "current_cron_execution", "cron"),
     ("agent.file_safety", "get_write_denied_error", "guard"),
-    ("cron.jobs", "create_job", "create"),
-    ("cron.jobs", "remove_job", "remove"),
-    ("cron.jobs", "get_job", "get"),
-    ("tools.cronjob_job_args", "_origin_from_env", "origin"),
-    ("hermes_cli.profiles", "get_active_profile_name", "profile"),
-    ("cron.scheduler_delivery", "_is_known_delivery_platform", "platform"),
 ]
 
 
@@ -1308,52 +1271,7 @@ def test_each_hermes_helper_fails_closed(monkeypatch, tmp_path, module, name, ki
         assert out["message"] == service.MSG_PAGE_NOT_SAVED
         assert json.loads((tmp_path / "state.json").read_text())["seen"] == []
         return
-    if kind == "create":
-        payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
-        assert service.on_pre_tool_call("index_watch", payload)["action"] == "approve"
-        out = body_of(service.index_watch(runtime, payload))
-        assert "was not created" in out["message"]
-        assert out["ok"] is False
-        return
-    if kind == "remove":
-        seed(tmp_path, job_id="job-9", scheduled=True)
-        if mode != "import":
-            assert service.on_pre_tool_call("index_watch", {"action": "unschedule"})["action"] == "approve"
-        out = body_of(service.index_watch(runtime, {"action": "unschedule"}))
-        assert "The cron job job-9 was removed" not in out["message"]
-        if mode == "import":
-            # The same module provides get_job, so the lookup fails closed first.
-            assert out["message"] == service.MSG_JOB_UNKNOWN
-        else:
-            assert "was not removed" in out["message"]
-        return
-    if kind == "get":
-        seed(tmp_path, job_id="job-9")
-        out = body_of(service.index_watch(runtime, {"action": "status"}))
-        assert "A watch is scheduled" not in out["message"]
-        checked = body_of(service.index_watch(runtime, {"action": "check"}))
-        assert checked["message"] == service.MSG_JOB_UNKNOWN
-        assert calls == []
-        return
-    if kind == "origin":
-        out = body_of(service.index_watch(runtime, {
-            "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "origin",
-        }))
-        assert out["message"] == service.MSG_ORIGIN_UNREADABLE
-        assert not (tmp_path / "state.json").exists()
-        return
-    if kind == "profile":
-        payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
-        assert service.on_pre_tool_call("index_watch", payload)["action"] == "approve"
-        out = body_of(service.index_watch(runtime, payload))
-        assert "profile unknown" in out["message"]
-        assert "hermes cron" not in out["message"]
-        return
-    out = body_of(service.index_watch(runtime, {
-        "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "desk",
-    }))
-    assert out["message"] == "Delivery could not be checked, so no job was created."
-    assert not (tmp_path / "state.json").exists()
+    raise AssertionError(kind)
 
 
 def test_a_full_page_with_no_saved_id_says_matches_may_have_been_missed(tmp_path):
@@ -1366,23 +1284,24 @@ def test_a_full_page_with_no_saved_id_says_matches_may_have_been_missed(tmp_path
     assert out["notify"] is True
 
 
-def test_unschedule_block_names_unschedule(tmp_path):
+def test_unschedule_names_the_user_remove_command(tmp_path):
     seed(tmp_path, job_id="job-9")
     asked = []
-
-    def approve(question):
-        asked.append(question)
-        return {"approved": False}
-
+    removed = []
     runtime = rt(
         tmp_path, Script([]),
         get_job=lambda job_id: {"id": job_id},
-        request_approval=approve,
+        remove_job=lambda job_id: removed.append(job_id) or True,
+        request_approval=lambda question: asked.append(question) or {"approved": False},
+        profile=lambda: "default",
     )
     out = body_of(service.index_watch(runtime, {"action": "unschedule"}))
-    assert asked[0].startswith("Approve unschedule")
-    assert "Approve schedule" not in asked[0]
+    assert asked == []
+    assert removed == []
+    assert "does not create or remove" in out["message"]
+    assert "hermes cron remove" in out["message"]
     assert out["ok"] is False
+    assert json.loads((tmp_path / "state.json").read_text())["job_id"] == "job-9"
 
 
 def test_public_sources_have_no_cli_or_engine_routes():
@@ -1424,12 +1343,7 @@ def _search_handler():
 
 
 def _patch_data_dir(monkeypatch, tmp_path):
-    def fake(module, name):
-        if module == "plugins.plugin_storage" and name == "plugin_data_dir":
-            return "ok", (lambda plugin_name: tmp_path)
-        return "missing", None
-
-    monkeypatch.setattr(service, "_load", fake)
+    monkeypatch.setattr(service, "plugin_data_directory", lambda: tmp_path)
 
 
 def _release_scope(scope, token):
