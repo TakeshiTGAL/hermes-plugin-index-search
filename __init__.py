@@ -20,8 +20,13 @@ def register(ctx) -> None:
     def _health(args, **_kwargs):
         return service.index_health(service.live_runtime(), args or {})
 
-    def _watch(args, **_kwargs):
-        return service.index_watch(service.live_runtime(), args or {})
+    def _watch(args, **kwargs):
+        return service.index_watch(
+            service.live_runtime(),
+            args or {},
+            session_id=kwargs.get("session_id") or "",
+            task_id=kwargs.get("task_id") or "",
+        )
 
     ctx.register_tool(
         name="index_search",
@@ -29,8 +34,9 @@ def register(ctx) -> None:
         schema={
             "name": "index_search",
             "description": (
-                "Search one index once. Returns the id, an optional short title, and estimatedTotalHits. "
+                "Search one Meilisearch index you run. Returns the id, an optional short title, and estimatedTotalHits. "
                 "Only the first 20 hits are returned. Does not advance seen ids, including when called from cron. Does not ask for approval."
+                ' Use it for a request such as "search my self-hosted Meilisearch"; Meilisearch is a full-text search engine, and this returns documents from that index.'
             ),
             "parameters": {
                 "type": "object",
@@ -50,7 +56,11 @@ def register(ctx) -> None:
         toolset=service.TOOLSET,
         schema={
             "name": "index_health",
-            "description": "GET /health on MEILI_HOST with no API key. Does not advance seen ids and does not ask for approval.",
+            "description": (
+                "Meilisearch health for the index host you run. "
+                "It sends GET /health to the search server at MEILI_HOST, with no API key. "
+                "Does not advance seen ids and does not ask for approval."
+            ),
             "parameters": {"type": "object", "properties": {}},
         },
         handler=_health,
@@ -61,6 +71,7 @@ def register(ctx) -> None:
         schema={
             "name": "index_watch",
             "description": (
+                "Meilisearch watch: new hits for one saved query. "
                 "Watch one saved query. schedule and unschedule ask for approval every time. "
                 "check reads the saved watch. A cron run with no arguments is check. "
                 "Seen ids advance only when check is a proven cron run and this plugin is not isolated."
@@ -79,3 +90,19 @@ def register(ctx) -> None:
         },
         handler=_watch,
     )
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        register_hook("pre_tool_call", service.on_pre_tool_call)
+    try:
+        from pathlib import Path
+        ctx.register_skill(
+            "meilisearch-index",
+            Path(__file__).resolve().parent / "skills" / "meilisearch-index" / "SKILL.md",
+            description=(
+                "Meilisearch index search and health. "
+                "Before web_search, use tool_search to find the Meilisearch tools and tool_call to run them."
+            ),
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("index-search skill was not registered", exc_info=True)

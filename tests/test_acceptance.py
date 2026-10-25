@@ -179,13 +179,13 @@ def test_empty_query_and_extra_args_do_not_call_http(tmp_path):
     runtime = rt(tmp_path, script)
     for query in ("", "   ", "x" * 401, 12):
         out = body_of(service.index_search(runtime, {"index": "probes", "q": query, "id_field": "sku"}))
-        assert out["message"] == service.MSG_QUERY
+        assert out["message"] == service.MSG_SEARCH_QUERY
         assert script.calls == []
     out = body_of(service.index_search(runtime, {"index": "probes", "q": "hermes", "id_field": "sku", "filter": "a"}))
     assert out["message"] == service.MSG_SEARCH_ARGS
     assert script.calls == []
     out = body_of(service.index_search(runtime, {"index": "../x", "q": "hermes", "id_field": "sku"}))
-    assert out["message"] == service.MSG_UID
+    assert out["message"] == service.MSG_SEARCH_UID
     assert script.calls == []
 
 
@@ -439,7 +439,10 @@ def test_schedule_blocks_before_approval(tmp_path):
         asked.clear()
         runtime = rt(tmp_path, script, gates=lambda g=gates: g, request_approval=approve, cron=lambda: "not_cron")
         service.index_watch(runtime, payload)
-        assert asked == []
+        # Hermes denies cron, yolo, approvals off, single-query, and unattended.
+        # This plugin still asks, and it does not create the job when create_job is absent.
+        assert len(asked) == 1
+        assert "schedule" in asked[0]
     assert script.calls == []
 
 
@@ -485,7 +488,9 @@ def test_schedule_asks_every_time_and_refuses_a_long_or_rewritten_query(tmp_path
     refused = body_of(service.index_watch(runtime, starred))
     assert refused["retryable"] is False
     assert len(asked) == before
-    assert service.make_rule_key() != service.make_rule_key()
+    same_plan = {"action": "schedule", "index": "probes", "q": "hermes"}
+    assert service.one_call_rule_key(same_plan) == service.one_call_rule_key(dict(same_plan))
+    assert service.one_call_rule_key(same_plan) != service.one_call_rule_key(dict(same_plan, q="other"))
 
 
 def test_delivery_rules_and_deliver_only_change(tmp_path):
@@ -661,7 +666,7 @@ def test_non_string_index_is_refused_before_http_and_is_not_saved(tmp_path):
     )
     for index in (1, True, False, None):
         searched = body_of(service.index_search(runtime, {"index": index, "q": "hermes", "id_field": "sku"}))
-        assert searched["message"] == service.MSG_UID
+        assert searched["message"] == service.MSG_SEARCH_UID
         scheduled = body_of(service.index_watch(runtime, {
             "action": "schedule", "index": index, "q": "hermes", "id_field": "sku", "deliver": "local",
         }))
@@ -1209,6 +1214,7 @@ def _install_hermes_fakes(monkeypatch, tmp_path):
     put("agent")
     put("agent.file_safety", get_write_denied_error=lambda path: None)
     put("cron")
+    put("cron.execution_identity", current_cron_execution=lambda: None)
     put(
         "cron.jobs",
         create_job=lambda **kwargs: {"id": "job-live"},
@@ -1260,13 +1266,8 @@ def _break_helper(monkeypatch, module, name, mode):
 
 HELPERS = [
     ("plugins.plugin_storage", "plugin_data_dir", "data_dir"),
-    ("tools.approval_context", "_is_cron_approval_context", "cron"),
+    ("cron.execution_identity", "current_cron_execution", "cron"),
     ("agent.file_safety", "get_write_denied_error", "guard"),
-    ("tools.approval", "_yolo_active", "gates"),
-    ("tools.approval_context", "_get_approval_mode", "gates"),
-    ("tools.approval_context", "_is_single_query_approval_context", "gates"),
-    ("tools.approval_context", "_is_unattended_platform_approval_context", "gates"),
-    ("tools.approval", "request_tool_approval", "approval"),
     ("cron.jobs", "create_job", "create"),
     ("cron.jobs", "remove_job", "remove"),
     ("cron.jobs", "get_job", "get"),
@@ -1301,35 +1302,23 @@ def test_each_hermes_helper_fails_closed(monkeypatch, tmp_path, module, name, ki
         assert json.loads((tmp_path / "state.json").read_text())["seen"] == []
         return
     if kind == "guard":
-        sys.modules["tools.approval_context"]._is_cron_approval_context = lambda: True
+        sys.modules["cron.execution_identity"].current_cron_execution = lambda: {"id": "cron"}
         seed(tmp_path, baseline_pending=True, seen=[], job_id="")
         out = body_of(service.index_watch(runtime, {"action": "check"}))
         assert out["message"] == service.MSG_PAGE_NOT_SAVED
         assert json.loads((tmp_path / "state.json").read_text())["seen"] == []
         return
-    if kind == "gates":
-        out = body_of(service.index_watch(runtime, {
-            "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
-        }))
-        assert out["message"] == service.MSG_CANNOT
-        assert not (tmp_path / "state.json").exists()
-        return
-    if kind == "approval":
-        out = body_of(service.index_watch(runtime, {
-            "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
-        }))
-        assert out["message"] == service.MSG_CANNOT
-        assert not (tmp_path / "state.json").exists()
-        return
     if kind == "create":
-        out = body_of(service.index_watch(runtime, {
-            "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
-        }))
+        payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
+        assert service.on_pre_tool_call("index_watch", payload)["action"] == "approve"
+        out = body_of(service.index_watch(runtime, payload))
         assert "was not created" in out["message"]
         assert out["ok"] is False
         return
     if kind == "remove":
         seed(tmp_path, job_id="job-9", scheduled=True)
+        if mode != "import":
+            assert service.on_pre_tool_call("index_watch", {"action": "unschedule"})["action"] == "approve"
         out = body_of(service.index_watch(runtime, {"action": "unschedule"}))
         assert "The cron job job-9 was removed" not in out["message"]
         if mode == "import":
@@ -1354,9 +1343,9 @@ def test_each_hermes_helper_fails_closed(monkeypatch, tmp_path, module, name, ki
         assert not (tmp_path / "state.json").exists()
         return
     if kind == "profile":
-        out = body_of(service.index_watch(runtime, {
-            "action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local",
-        }))
+        payload = {"action": "schedule", "index": "probes", "q": "hermes", "id_field": "sku", "deliver": "local"}
+        assert service.on_pre_tool_call("index_watch", payload)["action"] == "approve"
+        out = body_of(service.index_watch(runtime, payload))
         assert "profile unknown" in out["message"]
         assert "hermes cron" not in out["message"]
         return
@@ -1379,15 +1368,21 @@ def test_a_full_page_with_no_saved_id_says_matches_may_have_been_missed(tmp_path
 
 def test_unschedule_block_names_unschedule(tmp_path):
     seed(tmp_path, job_id="job-9")
+    asked = []
+
+    def approve(question):
+        asked.append(question)
+        return {"approved": False}
+
     runtime = rt(
         tmp_path, Script([]),
-        gates=lambda: {"cron": False, "yolo": True, "approvals": "manual", "single_query": False, "unattended": False, "approval_loaded": True},
         get_job=lambda job_id: {"id": job_id},
-        request_approval=lambda question: {"approved": True},
+        request_approval=approve,
     )
     out = body_of(service.index_watch(runtime, {"action": "unschedule"}))
-    assert "so unschedule was not asked" in out["message"]
-    assert "so schedule was not asked" not in out["message"]
+    assert asked[0].startswith("Approve unschedule")
+    assert "Approve schedule" not in asked[0]
+    assert out["ok"] is False
 
 
 def test_public_sources_have_no_cli_or_engine_routes():

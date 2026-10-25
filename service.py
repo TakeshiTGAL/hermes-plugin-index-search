@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import importlib
 import json
 import os
 import re
-import uuid
+import threading
+import time
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -40,7 +42,22 @@ REFUSED_DELIVER = {"cli", "cron", "api_server", "bot-chat"}
 PLAIN_DELIVER = {"origin", "local", "all"}
 
 MSG_QUERY = "The query must be a non-empty string of 400 characters or fewer."
-MSG_SEARCH_ARGS = "index_search takes only index, q, id_field, and an optional title_field."
+MSG_SEARCH_ARGS = (
+    "index_search takes only index, q, id_field, and an optional title_field, "
+    "for example index probes, q hermes, and id_field sku."
+)
+MSG_SEARCH_QUERY = MSG_QUERY + " Use a query such as hermes."
+MSG_SEARCH_UID = (
+    "The index uid must be 1 to 64 letters, digits, hyphens, or underscores, such as probes."
+)
+MSG_SEARCH_ID = (
+    "The id field must be a non-empty string of 64 characters or fewer, "
+    "without a dot, a slash, or a control character, such as sku."
+)
+MSG_SEARCH_TITLE = (
+    "The title field must be a non-empty string of 64 characters or fewer, "
+    "without a dot, a slash, or a control character, such as title."
+)
 MSG_UID = "The index uid must be 1 to 64 letters, digits, hyphens, or underscores."
 MSG_HOST_REQUIRED = "MEILI_HOST is required."
 MSG_HOST_BAD = "MEILI_HOST is not a usable origin."
@@ -69,10 +86,13 @@ MSG_GAP = (
     " This page shares no saved id, so matches between the saved ids and this page may have been missed."
 )
 MSG_MANUAL_SEEN = " This call did not write seen ids."
-MSG_HEALTH_ARGS = "index_health takes no arguments."
+MSG_HEALTH_ARGS = "index_health takes no arguments, so call it with an empty object."
 MSG_APPROVAL_FIT = "The approval text does not fit in one message. Shorten the query and try again."
 MSG_BAD_PAGE = "The search returned an unusable page, so seen ids were not advanced."
-MSG_ACTION = "index_watch action must be schedule, unschedule, status, or check."
+MSG_ACTION = (
+    "index_watch action must be schedule, unschedule, status, or check. "
+    "Call index_watch with action status to see the watch. Status does not ask for approval. " "日本語: 見張りを見るだけなら action を status にして index_watch をもう一度呼ぶ。"
+)
 MSG_KEY_IN_URL = "The API key is part of the request URL, so nothing was sent."
 MSG_NOTHING_UNSCHEDULE = "There is nothing to unschedule. Seen ids were kept."
 MSG_JOB_GONE = "The cron job is gone. Seen ids were not advanced."
@@ -115,6 +135,9 @@ class Runtime:
         self.exchange = kwargs.get("exchange") or client.perform
         self.gates = kwargs.get("gates") or _open_gates
         self.request_approval = kwargs.get("request_approval") or (lambda question: {"approved": False})
+        self.public_approval = bool(kwargs.get("public_approval"))
+        self.approval_payload = kwargs.get("approval_payload")
+        self.approval_ids = kwargs.get("approval_ids") or ("", "")
         self.create_job = kwargs.get("create_job") or (lambda **kw: (_ for _ in ()).throw(RuntimeError("no cron")))
         self.remove_job = kwargs.get("remove_job") or (lambda job_id: False)
         self.get_job = kwargs.get("get_job") or (lambda job_id: {"id": job_id})
@@ -151,11 +174,13 @@ def live_runtime() -> Runtime:
         raise RuntimeError("data dir unavailable") from exc
 
     def cron():
-        status, fn = _load("tools.approval_context", "_is_cron_approval_context")
-        if status != "ok":
-            return "unknown"
+        # Published mark. A missing helper is not a manual turn.
         try:
-            return "cron" if fn() else "not_cron"
+            module = importlib.import_module("cron.execution_identity")
+            fn = getattr(module, "current_cron_execution", None)
+            if not callable(fn):
+                return "unknown"
+            return "cron" if fn() is not None else "not_cron"
         except Exception:
             return "unknown"
 
@@ -171,51 +196,18 @@ def live_runtime() -> Runtime:
         return fn(path)
 
     def gates():
-        out = {}
-        status, fn = _load("tools.approval_context", "_is_cron_approval_context")
-        if status != "ok":
-            return {"unreadable": True}
-        try:
-            out["cron"] = bool(fn())
-        except Exception:
-            return {"unreadable": True}
-        status, fn = _load("tools.approval", "_yolo_active")
-        if status != "ok":
-            return {"unreadable": True}
-        try:
-            out["yolo"] = bool(fn())
-        except Exception:
-            return {"unreadable": True}
-        status, fn = _load("tools.approval_context", "_get_approval_mode")
-        if status != "ok":
-            return {"unreadable": True}
-        try:
-            out["approvals"] = fn()
-        except Exception:
-            return {"unreadable": True}
-        status, fn = _load("tools.approval_context", "_is_single_query_approval_context")
-        if status != "ok":
-            return {"unreadable": True}
-        try:
-            out["single_query"] = bool(fn())
-        except Exception:
-            return {"unreadable": True}
-        status, fn = _load("tools.approval_context", "_is_unattended_platform_approval_context")
-        if status != "ok":
-            return {"unreadable": True}
-        try:
-            out["unattended"] = bool(fn())
-        except Exception:
-            return {"unreadable": True}
-        status, _fn = _load("tools.approval", "request_tool_approval")
-        out["approval_loaded"] = status == "ok"
-        if status != "ok":
-            return {"unreadable": True}
-        return out
+        # yolo, approvals off, cron, single-query, and unattended are Hermes's gate.
+        return {
+            "cron": False,
+            "yolo": False,
+            "approvals": "manual",
+            "single_query": False,
+            "unattended": False,
+            "approval_loaded": True,
+        }
 
     def request_approval(question: str):
-        _status, fn = _load("tools.approval", "request_tool_approval")
-        return fn("index_watch", question, rule_key=make_rule_key())
+        return {"approved": False}
 
     def create_job(**kwargs):
         status, fn = _load("cron.jobs", "create_job")
@@ -298,6 +290,7 @@ def live_runtime() -> Runtime:
         known_platform=known_platform,
         write_guard=guard_fn,
         session_origin=session_origin,
+        public_approval=True,
     )
 
 
@@ -378,6 +371,31 @@ def _origin(value: str | None) -> tuple[str | None, str | None]:
     if parts.port:
         origin += f":{parts.port}"
     return origin, None
+
+
+_FW_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def _fold_digits(value):
+    if isinstance(value, str):
+        return value.strip().translate(_FW_DIGITS)
+    return value
+
+
+_SEARCH_AGAIN = (
+    "Call index_search once with index probes, q hermes, and id_field sku. " "日本語: 例の index と q と id_field で index_search をもう一度呼ぶ。"
+)
+_HOST_STEP = (
+    "Set MEILI_HOST to an origin such as http://127.0.0.1:7700, then call index_health with no arguments. " "日本語: ホストを設定して、引数なしの index_health を呼ぶ。"
+)
+
+
+def _search_arg(secret: str, message: str) -> str:
+    step = message if "id_field" in message else f"{message} {_SEARCH_AGAIN}"
+    return reply(
+        message, ok=False, notify=False, secret=secret, retryable=False,
+        error_type="bad_args", next_step=step,
+    )
 
 
 def _uid_ok(value) -> bool:
@@ -612,10 +630,11 @@ def _watch_state(runtime: Runtime):
 def index_health(runtime: Runtime, args) -> str:
     data = _as_dict(args)
     if data is None or data:
-        return reply(MSG_HEALTH_ARGS, ok=False, notify=False, retryable=False)
+        return reply(MSG_HEALTH_ARGS, ok=False, notify=False, retryable=False, error_type="bad_args")
     origin, err = _origin(runtime.env.get("MEILI_HOST"))
     if err:
-        return reply(err, ok=False, notify=False, retryable=False)
+        extra = {"next_step": _HOST_STEP} if err == MSG_HOST_REQUIRED else {}
+        return reply(err, ok=False, notify=False, retryable=False, **extra)
     secret = _secret(runtime)
     url = _health_url(origin)
     try:
@@ -640,30 +659,26 @@ def index_search(runtime: Runtime, args) -> str:
     data = _as_dict(args)
     secret = _secret(runtime)
     if data is None:
-        return reply(MSG_SEARCH_ARGS, ok=False, notify=False, secret=secret, retryable=False)
+        return _search_arg(secret, MSG_SEARCH_ARGS)
     extra = set(data) - {"index", "q", "id_field", "title_field"}
     if extra:
-        return reply(MSG_SEARCH_ARGS, ok=False, notify=False, secret=secret, retryable=False)
+        return _search_arg(secret, MSG_SEARCH_ARGS)
+    data = {key: _fold_digits(value) for key, value in data.items()}
     if not _uid_ok(data.get("index")):
-        return reply(MSG_UID, ok=False, notify=False, secret=secret, retryable=False)
+        return _search_arg(secret, MSG_SEARCH_UID)
     if not _query_ok(data.get("q")):
-        return reply(MSG_QUERY, ok=False, notify=False, secret=secret, retryable=False)
+        return _search_arg(secret, MSG_SEARCH_QUERY)
     if not _field_ok(data.get("id_field")):
-        return reply(
-            "The id field must be a non-empty string of 64 characters or fewer, without a dot, a slash, or a control character.",
-            ok=False, notify=False, secret=secret, retryable=False,
-        )
+        return _search_arg(secret, MSG_SEARCH_ID)
     title_field = ""
     if "title_field" in data and data.get("title_field") not in (None, ""):
         if not _field_ok(data.get("title_field")):
-            return reply(
-                "The title field must be a non-empty string of 64 characters or fewer, without a dot, a slash, or a control character.",
-                ok=False, notify=False, secret=secret, retryable=False,
-            )
+            return _search_arg(secret, MSG_SEARCH_TITLE)
         title_field = data["title_field"]
     origin, err = _origin(runtime.env.get("MEILI_HOST"))
     if err:
-        return reply(err, ok=False, notify=False, secret=secret, retryable=False)
+        extra = {"next_step": _HOST_STEP} if err == MSG_HOST_REQUIRED else {}
+        return reply(err, ok=False, notify=False, secret=secret, retryable=False, **extra)
     if not secret:
         return reply(MSG_KEY_REQUIRED, ok=False, notify=False, secret="", retryable=False)
     page = _call_search(runtime, origin, data["index"], data["q"], secret)
@@ -927,25 +942,13 @@ def _fits(text: str) -> bool:
 
 
 def _schedule_block(runtime: Runtime, action: str) -> str | None:
-    if _form(runtime) == "cannot":
-        return MSG_CANNOT
+    """Host process only. yolo, approvals off, cron, and unattended are Hermes's gate."""
+    del action
     try:
-        gates = runtime.gates()
+        host = runtime.host()
     except Exception:
         return MSG_CANNOT
-    if not isinstance(gates, dict) or gates.get("unreadable"):
-        return MSG_CANNOT
-    if gates.get("cron") or _form(runtime) == "cron":
-        return "Schedule and unschedule are refused in a cron session. Seen ids were not changed."
-    if gates.get("yolo"):
-        return f"Hermes yolo is on, so {action} was not asked. Seen ids were not changed."
-    if gates.get("approvals") == "off":
-        return f"Hermes approvals are off, so {action} was not asked. Seen ids were not changed."
-    if gates.get("single_query"):
-        return f"A single-query session cannot {action} a watch. Seen ids were not changed."
-    if gates.get("unattended"):
-        return f"An unattended session cannot {action} a watch. Seen ids were not changed."
-    if not gates.get("approval_loaded", True):
+    if host not in (None, "", "0"):
         return MSG_CANNOT
     return None
 
@@ -1014,8 +1017,160 @@ def _origin_plan(runtime: Runtime, deliver: str) -> tuple[dict | None, str, str 
     ), None
 
 
-def make_rule_key() -> str:
-    return f"index_watch:{uuid.uuid4().hex}"
+def one_call_rule_key(plan: dict) -> str:
+    """Hermes stores session and always under this key. The same plan matches; another does not."""
+    body = json.dumps(plan, sort_keys=True, separators=(",", ":"), default=str)
+    return "index_watch:" + hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+_LOCK = threading.Lock()
+_STASH: dict[tuple, tuple[str, float]] = {}
+_STASH_TTL = 600
+
+
+def _ids(kwargs: dict) -> tuple[str, str]:
+    return (str(kwargs.get("session_id") or ""), str(kwargs.get("task_id") or ""))
+
+
+def _stash_key(payload: dict, ids: tuple[str, str]) -> tuple:
+    fields = {str(key): payload[key] for key in payload}
+    return ("index_watch", json.dumps(fields, sort_keys=True, default=str), ids[0], ids[1])
+
+
+def remember_watch(payload: dict, ids: tuple[str, str], question: str) -> None:
+    with _LOCK:
+        _STASH[_stash_key(payload, ids)] = (question, time.monotonic())
+
+
+def take_watch(payload: dict, ids: tuple[str, str], question: str) -> str | None:
+    """Pop this call's question. Missing, stale, or different means do not create or remove the job."""
+    with _LOCK:
+        found = _STASH.pop(_stash_key(payload, ids), None)
+    if found is None:
+        return "The watch change was not approved. Seen ids were not changed."
+    stored, made = found
+    if time.monotonic() - made > _STASH_TTL:
+        return "BLOCKED: the approval is too old. Seen ids were not changed."
+    if stored != question:
+        return "The target changed after the preview. Seen ids were not changed."
+    return None
+
+
+def _host_blocked(runtime: Runtime) -> bool:
+    try:
+        host = runtime.host()
+    except Exception:
+        return True
+    return host not in (None, "", "0")
+
+
+def _preview_question(runtime: Runtime, data: dict) -> tuple[str, str] | None:
+    """The approval line and its stable rule key, or None when this call would not ask."""
+    if _host_blocked(runtime):
+        return None
+    action = data.get("action")
+    shown: list[tuple[str, str]]
+    if action == "schedule":
+        allowed = {"action", "index", "q", "id_field", "title_field", "deliver"}
+        if set(data) - allowed:
+            return None
+        if not _uid_ok(data.get("index")) or not _query_ok(data.get("q")) or not _field_ok(data.get("id_field")):
+            return None
+        if "title_field" in data and data.get("title_field") not in (None, ""):
+            if not _field_ok(data.get("title_field")):
+                return None
+        if _deliver_error(runtime, data.get("deliver")):
+            return None
+        deliver = _canonical_deliver(data["deliver"])
+        _origin_for_job, _origin_note, origin_error = _origin_plan(runtime, deliver)
+        if origin_error:
+            return None
+        question = _approval_question("schedule", data["index"], data["q"], data["id_field"], deliver)
+        plan = {
+            "action": "schedule",
+            "deliver": deliver,
+            "id_field": data["id_field"],
+            "index": data["index"],
+            "q": data["q"],
+            "title_field": data.get("title_field") or "",
+        }
+        shown = [
+            ("index", data["index"]),
+            ("q", data["q"]),
+            ("id_field", data["id_field"]),
+            ("deliver", deliver),
+        ]
+    elif action == "unschedule":
+        if set(data) - {"action"}:
+            return None
+        kind, current = _watch_state(runtime)
+        if kind == "corrupt":
+            return None
+        state = store.normalize(current) if current else None
+        if state is None or not state.get("scheduled") or not (state.get("job_id") or ""):
+            return None
+        job_id = state.get("job_id") or ""
+        if _job_presence(runtime, job_id) != "present":
+            return None
+        if _form(runtime) == "cannot":
+            return None
+        index = state.get("index") or ""
+        query = state.get("q") or ""
+        id_field = state.get("id_field") or ""
+        deliver = state.get("deliver") or "local"
+        question = _approval_question(
+            "unschedule", index or "(none)", query or "(none)", id_field or "(none)", deliver, job_id,
+        )
+        plan = {
+            "action": "unschedule",
+            "deliver": deliver,
+            "id_field": id_field,
+            "index": index,
+            "job_id": job_id,
+            "q": query,
+        }
+        shown = [
+            ("index", index),
+            ("q", query),
+            ("id_field", id_field),
+            ("deliver", deliver),
+            ("job_id", job_id),
+        ]
+    else:
+        return None
+    for _field, value in shown:
+        if _rewrite_risk(value if isinstance(value, str) else ""):
+            return None
+    if not _fits(question):
+        return None
+    return question, one_call_rule_key(plan)
+
+
+def on_pre_tool_call(tool_name: str = "", args=None, **kwargs):
+    """Approve schedule and unschedule. Search, health, status, and check stay silent."""
+    if tool_name != "index_watch":
+        return None
+    # Every watch change in this session and task starts clean. Other rooms keep
+    # their own previews while they wait for an answer.
+    room = _ids(kwargs)
+    with _LOCK:
+        for key in [k for k in _STASH if k[2:] == room]:
+            del _STASH[key]
+    payload = dict(args) if isinstance(args, dict) else {}
+    if payload.get("action") not in ("schedule", "unschedule"):
+        return None
+    try:
+        runtime = live_runtime()
+    except Exception:
+        return None
+    found = _preview_question(runtime, payload)
+    if not found:
+        return None
+    question, rule_key = found
+    if "\n" in question or "`" in question:
+        return None
+    remember_watch(payload, _ids(kwargs), question)
+    return {"action": "approve", "message": question, "rule_key": rule_key}
 
 
 def _profile_name(runtime: Runtime) -> str | None:
@@ -1049,6 +1204,13 @@ def _ask(runtime: Runtime, action: str, question: str, shown) -> str | None:
             return reply(rewrite_message(field, action), ok=False, notify=True, retryable=False)
     if not _fits(question):
         return reply(MSG_APPROVAL_FIT, ok=False, notify=True, retryable=False)
+    if getattr(runtime, "public_approval", False):
+        payload = runtime.approval_payload if isinstance(runtime.approval_payload, dict) else {}
+        ids = runtime.approval_ids if isinstance(runtime.approval_ids, tuple) else ("", "")
+        reason = take_watch(payload, ids, question)
+        if reason:
+            return reply(reason, ok=False, notify=True, retryable=False, isError=True)
+        return None
     try:
         result = runtime.request_approval(question)
     except Exception:
@@ -1305,7 +1467,10 @@ def _status(runtime: Runtime, data: dict) -> str:
     )
 
 
-def index_watch(runtime: Runtime, args) -> str:
+def index_watch(runtime: Runtime, args, **kwargs) -> str:
+    if getattr(runtime, "public_approval", False):
+        runtime.approval_payload = dict(args) if isinstance(args, dict) else {}
+        runtime.approval_ids = (str(kwargs.get("session_id") or ""), str(kwargs.get("task_id") or ""))
     data = _as_dict(args)
     secret = _secret(runtime)
     if data is None:
